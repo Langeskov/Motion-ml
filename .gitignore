@@ -1,0 +1,40 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# ========== 虚拟环境 (本地, 勿上传) ==========
+.venv/
+venv/
+env/
+ENV/
+
+# ========== 采集数据 (个人 GPS 轨迹, 隐私敏感) ==========
+data/raw/
+
+# ========== 训练产物 ==========
+checkpoints/
+runs/
+*.pth
+*.onnx
+*.pt
+
+# ========== IDE ==========
+.idea/
+.vscode/
+*.iml
+
+# ========== OS ==========
+.DS_Store
+Thumbs.db
+
+# ========== 日志/临时 ==========
+*.log
+*.hprof
+tmp/
