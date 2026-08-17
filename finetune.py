@@ -40,7 +40,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.loader import build_dataset, LABEL_MAP, INPUT_SIZE
+from dataset.session_dataset import build_session_dataset, LABEL_MAP
 from models.motion_encoder import build_classifier
 
 
@@ -259,7 +259,7 @@ def main():
     print("=" * 60)
 
     # ── 1. 构建有标签数据集 ─────────────────────────
-    dataset, scaler = build_dataset(
+    dataset, scaler = build_session_dataset(
         data_dir=args.data_dir,
         window_size=args.window_size,
         stride=args.stride,

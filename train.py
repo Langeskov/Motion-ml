@@ -33,7 +33,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.loader import build_dataset, LABEL_MAP, INPUT_SIZE
+from dataset.session_dataset import build_session_dataset, LABEL_MAP
 from models import build_model_by_type, MODEL_TYPES
 
 
@@ -328,7 +328,7 @@ def main():
     print(f"  Motion Model Training V4 ({args.model.upper()})")
     print("=" * 60)
 
-    dataset, scaler = build_dataset(
+    dataset, scaler = build_session_dataset(
         data_dir=args.data_dir,
         window_size=args.window_size,
         stride=args.stride,

@@ -31,7 +31,7 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 
-from dataset.loader import build_dataset, LABEL_MAP
+from dataset.session_dataset import build_session_dataset, LABEL_MAP
 from models import load_model_from_checkpoint, build_model_by_type
 from models.motion_encoder import build_classifier
 
@@ -130,7 +130,7 @@ def main():
     scaler.mean_ = scaler_mean
     scaler.scale_ = scaler_scale
 
-    dataset, _ = build_dataset(
+    dataset, _ = build_session_dataset(
         data_dir=args.data_dir,
         window_size=args.window_size,
         stride=args.stride,

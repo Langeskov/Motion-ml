@@ -21,6 +21,7 @@ data/raw/
 # ========== 训练产物 ==========
 checkpoints/
 runs/
+exported/
 *.pth
 *.onnx
 *.pt

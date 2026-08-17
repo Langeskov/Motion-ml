@@ -34,8 +34,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.loader import load_csv_files, clean_data, normalize_features, create_sliding_windows
-from dataset.preprocess import FeatureExtractor
+from dataset.session_loader import SessionDataset
+from dataset.session_dataset import MotionWindowDataset
 from models.motion_encoder import build_pretrain_model
 from models.mask_generator import MaskGenerator
 
@@ -83,41 +83,31 @@ def build_unlabeled_dataset(
     stride: int = 50,
 ):
     """
-    构建无标签数据集。
+    构建无标签数据集 (V5 Session 管线)。
 
-    读取 CSV，进行特征工程和标准化，生成滑动窗口。
+    流程: Session 扫描 → TimeAligner → FeatureBuilder → FeatureExtractor
+          → StandardScaler → 滑动窗口
     不使用 label 列 (自监督预训练不需要标签)。
 
     Returns:
         X: [num_samples, window_size, input_size]  numpy array
         scaler: fitted StandardScaler
     """
-    from sklearn.preprocessing import StandardScaler
+    sessions = SessionDataset(data_dir)
+    print(sessions.summary())
 
-    # 读取 CSV
-    df = load_csv_files(data_dir)
-    df = clean_data(df)
+    dataset = MotionWindowDataset(
+        sessions=sessions,
+        window_size=window_size,
+        stride=stride,
+    )
 
-    # 特征工程
-    extractor = FeatureExtractor()
-    df = extractor.transform(df)
-
-    # 标准化 (不使用 label)
-    feature_cols = extractor.ALL_COLS
-    features = df[feature_cols].values.astype(np.float32)
-
-    scaler = StandardScaler()
-    features = scaler.fit_transform(features)
-
-    # 滑动窗口 (使用全 0 作为占位 label)
-    labels = np.zeros(len(features), dtype=np.int64)
-    X, _ = create_sliding_windows(features, labels, window_size, stride)
-
+    X = dataset.X
     print(f"[Pretrain] Dataset: {X.shape[0]} windows, "
           f"shape=({window_size}, {X.shape[2]})")
     print(f"[Pretrain] No labels used (self-supervised)")
 
-    return X, scaler
+    return X, dataset.scaler
 
 
 def train_one_epoch(

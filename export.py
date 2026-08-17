@@ -111,6 +111,7 @@ def export_onnx(model, output_dir: str, model_type: str, seq_len: int = 150):
             dummy_input,
             path,
             export_params=True,
+            external_data=False,  # 权重内嵌, 产出单文件 .onnx
             opset_version=17,
             do_constant_folding=True,
             input_names=["input"],
@@ -125,9 +126,11 @@ def export_onnx(model, output_dir: str, model_type: str, seq_len: int = 150):
         print(f"[Export] Saved ONNX: {path} ({size_mb:.2f} MB)")
         return path
 
-    except ImportError:
-        print("[Export] ONNX export requires 'onnx' package: pip install onnx")
-        print("[Export] Skipping ONNX export.")
+    except ImportError as e:
+        # torch.onnx.export (dynamo) 依赖 onnx + onnxscript，
+        # 缺少任何一个都会抛 ImportError，需指明真实缺失的包
+        print(f"[Export] ONNX export failed — missing dependency: {e}")
+        print("[Export] Try: pip install onnx onnxscript")
         return None
     except Exception as e:
         print(f"[Export] ONNX export failed: {e}")
