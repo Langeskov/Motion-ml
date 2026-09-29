@@ -373,7 +373,19 @@ def main():
     if not args.no_tensorboard:
         writer = SummaryWriter(log_dir=log_dir)
         dummy_input = torch.randn(1, args.window_size, actual_input_size).to(device)
-        writer.add_graph(model, dummy_input)
+        # torch.jit.trace 的 check_trace 在 Transformer 模型上因图结构差异误报，
+        # 临时 patch 强制 check_trace=False 绕过
+        import functools
+        from unittest.mock import patch as _patch
+        _orig_trace = torch.jit.trace
+        @functools.wraps(_orig_trace)
+        def _nocheck_trace(*a, **kw):
+            kw["check_trace"] = False
+            return _orig_trace(*a, **kw)
+        model.eval()
+        with _patch.object(torch.jit, "trace", _nocheck_trace):
+            writer.add_graph(model, dummy_input)
+        model.train()
         print(f"[Train] TensorBoard logging to: {log_dir}")
 
     # ── 5. 训练循环 ──────────────────────────────────

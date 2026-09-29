@@ -22,7 +22,7 @@ import os
 import numpy as np
 import torch
 
-from dataset.loader import LABEL_MAP
+from dataset.session_dataset import LABEL_MAP
 from models import build_model_by_type
 from models.motion_encoder import build_classifier
 

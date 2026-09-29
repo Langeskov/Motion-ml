@@ -306,7 +306,17 @@ def main():
     if not args.no_tensorboard:
         writer = SummaryWriter(log_dir=log_dir)
         dummy_input = torch.randn(1, args.window_size, actual_input_size).to(device)
-        writer.add_graph(model, dummy_input)
+        import functools
+        from unittest.mock import patch as _patch
+        _orig_trace = torch.jit.trace
+        @functools.wraps(_orig_trace)
+        def _nocheck_trace(*a, **kw):
+            kw["check_trace"] = False
+            return _orig_trace(*a, **kw)
+        model.eval()
+        with _patch.object(torch.jit, "trace", _nocheck_trace):
+            writer.add_graph(model, dummy_input)
+        model.train()
         print(f"[Finetune] TensorBoard: {log_dir}")
 
     # ── 4. 训练循环 ────────────────────────────────

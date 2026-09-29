@@ -1,51 +1,17 @@
 """
 test_v5_pipeline.py
 ===================
-验证 V5 自监督预训练管线的完整性。
-生成合成数据进行端到端测试。
+验证 V5 预训练管线的完整性。
 """
 
 import os
 import sys
-import tempfile
-import shutil
 
 import numpy as np
-import pandas as pd
 import torch
 
 # 确保项目根目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-
-def generate_synthetic_csv(output_dir: str, num_files: int = 2, num_rows: int = 1000):
-    """生成合成 CSV 数据用于测试。"""
-    os.makedirs(output_dir, exist_ok=True)
-
-    for i in range(num_files):
-        data = {
-            "timestamp": np.arange(num_rows) * 20,  # 50Hz
-            "acc_x": np.random.randn(num_rows) * 2,
-            "acc_y": np.random.randn(num_rows) * 2,
-            "acc_z": np.random.randn(num_rows) * 2 + 9.8,
-            "gyro_x": np.random.randn(num_rows) * 0.5,
-            "gyro_y": np.random.randn(num_rows) * 0.5,
-            "gyro_z": np.random.randn(num_rows) * 0.5,
-            "mag_x": np.random.randn(num_rows) * 10,
-            "mag_y": np.random.randn(num_rows) * 10,
-            "mag_z": np.random.randn(num_rows) * 10,
-            "roll": np.random.randn(num_rows) * 10,
-            "pitch": np.random.randn(num_rows) * 10,
-            "yaw": np.random.randn(num_rows) * 180,
-            "latitude": np.random.uniform(30, 40, num_rows),
-            "longitude": np.random.uniform(100, 120, num_rows),
-            "gps_speed": np.random.uniform(0, 30, num_rows),  # km/h
-            "label": np.random.choice(["STATIONARY", "WALKING", "CYCLING", "CAR", "TRAIN"], num_rows),
-        }
-        df = pd.DataFrame(data)
-        path = os.path.join(output_dir, f"test_data_{i}.csv")
-        df.to_csv(path, index=False)
-        print(f"  Generated: {path} ({num_rows} rows)")
 
 
 def test_mask_generator():
@@ -177,36 +143,6 @@ def test_freeze_unfreeze():
     print("  ✓ Freeze/Unfreeze OK")
 
 
-def test_dataset_loader():
-    """测试数据加载管线。"""
-    print("\n[TEST] Dataset Loader")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        csv_dir = os.path.join(tmpdir, "csv")
-        generate_synthetic_csv(csv_dir, num_files=2, num_rows=500)
-
-        from dataset.loader import load_csv_files, clean_data, normalize_features, create_sliding_windows
-        from dataset.preprocess import FeatureExtractor
-
-        df = load_csv_files(csv_dir)
-        assert len(df) == 1000, f"Rows: {len(df)}"
-
-        df = clean_data(df)
-
-        # 需要先运行 FeatureExtractor 生成派生特征
-        extractor = FeatureExtractor()
-        df = extractor.transform(df)
-
-        features, scaler = normalize_features(df)
-        assert features.shape[0] > 0
-
-        labels = np.zeros(len(features), dtype=np.int64)
-        X, Y = create_sliding_windows(features, labels, window_size=150, stride=50)
-        assert X.shape[1] == 150
-        assert X.shape[0] > 0
-        print(f"  ✓ Dataset: X={X.shape}, Y={Y.shape}")
-
-
 def test_build_functions():
     """测试 build_* 函数。"""
     print("\n[TEST] Build Functions")
@@ -246,7 +182,6 @@ def main():
         test_classifier_forward_backward,
         test_pretrain_to_finetune,
         test_freeze_unfreeze,
-        test_dataset_loader,
         test_build_functions,
         test_model_factory,
     ]

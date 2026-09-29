@@ -38,16 +38,32 @@ def _sliding_windows(
     labels: np.ndarray,
     window_size: int,
     stride: int,
+    fixed_label: int = -1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """滑动窗口切分。"""
+    """
+    滑动窗口切分。
+
+    Args:
+        features:     [N, D] 特征矩阵
+        labels:       [N] 帧级标签
+        window_size:  窗口大小
+        stride:       滑动步长
+        fixed_label:  >=0 时直接使用此标签 (Session 级)，否则用帧级多数投票
+
+    Returns:
+        (X, Y) 窗口特征和标签
+    """
     X, Y = [], []
     n = len(features)
 
     for start in range(0, n - window_size + 1, stride):
         end = start + window_size
         window_feat = features[start:end]
-        window_label = labels[start:end]
-        label = np.bincount(window_label).argmax()
+        if fixed_label >= 0:
+            label = fixed_label
+        else:
+            window_label = labels[start:end]
+            label = np.bincount(window_label).argmax()
         X.append(window_feat)
         Y.append(label)
 
@@ -110,11 +126,12 @@ class MotionWindowDataset(Dataset):
         aligner = TimeAligner(max_gap_ms=max_gap_ms)
         extractor = FeatureExtractor(rolling_window=rolling_window)
 
-        # ── 1. 逐 Session: 对齐 → FeatureBuilder → FeatureExtractor ──
-        all_features = []
-        all_labels = []
+        # ── 1. 逐 Session: 对齐 → 特征工程 → 标准化 → 滑动窗口 ──
+        all_window_X = []
+        all_window_Y = []
         total_matched = 0
         total_imu = 0
+        total_windows = 0
 
         for session in session_list:
             # Step A: TimeAligner — GNSS m/s 对齐到 IMU 时间轴
@@ -156,38 +173,59 @@ class MotionWindowDataset(Dataset):
             feat = feat[valid_mask]
             labels = labels[valid_mask].astype(np.int64)
 
-            all_features.append(feat)
-            all_labels.append(labels)
+            # Step D: 逐 Session 做滑动窗口 (防止跨 Session 数据泄漏)
+            session_label = LABEL_MAP.get(session.label.upper().strip(), -1)
+            if session_label < 0:
+                if verbose:
+                    print(f"  [{session.session_id}] 跳过: 未知标签 '{session.label}'")
+                continue
 
-        if not all_features:
-            raise ValueError("没有可用的 Session 数据")
+            session_X, session_Y = _sliding_windows(
+                feat, labels, window_size, stride, fixed_label=session_label
+            )
+            n_windows = len(session_X)
+            if n_windows == 0:
+                if verbose:
+                    print(f"  [{session.session_id}] 跳过: 帧数 {len(feat)} < 窗口大小 {window_size}")
+                continue
 
-        # ── 2. 拼接 ───────────────────────────────────
-        features_cat = np.concatenate(all_features, axis=0)
-        labels_cat = np.concatenate(all_labels, axis=0)
+            all_window_X.append(session_X)
+            all_window_Y.append(session_Y)
+            total_windows += n_windows
 
-        # ── 3. 标准化 ───────────────────────────────────
+            if verbose:
+                print(f"  [{session.session_id}] 窗口: {n_windows} 个")
+
+        if not all_window_X:
+            raise ValueError("没有可用的 Session 数据 (所有 Session 帧数不足或标签无效)")
+
+        # ── 2. 拼接窗口 (不再跨 Session) ──────────────
+        features_cat = np.concatenate(all_window_X, axis=0)  # [total_windows, window_size, D]
+        labels_cat = np.concatenate(all_window_Y, axis=0)    # [total_windows]
+
+        # ── 3. 标准化 (在窗口维度上展平→标准化→恢复形状) ──
+        n_windows_total, ws, feat_dim = features_cat.shape
+        flat_features = features_cat.reshape(-1, feat_dim)
+
         if scaler is None:
             scaler = StandardScaler()
 
         if fit_scaler:
-            self.features = scaler.fit_transform(features_cat).astype(np.float32)
+            flat_features = scaler.fit_transform(flat_features).astype(np.float32)
         else:
-            self.features = scaler.transform(features_cat).astype(np.float32)
+            flat_features = scaler.transform(flat_features).astype(np.float32)
 
         self.scaler = scaler
-        self.feature_dim = self.features.shape[1]
+        self.feature_dim = feat_dim
 
-        # ── 4. 滑动窗口 ────────────────────────────────
-        self.X, self.Y = _sliding_windows(
-            self.features, labels_cat, window_size, stride
-        )
+        # ── 4. 恢复窗口形状 ──────────────────────────
+        self.X = flat_features.reshape(n_windows_total, ws, feat_dim)
+        self.Y = labels_cat
 
         if verbose:
             print(f"[MotionWindowDataset] Sessions: {len(session_list)}, "
-                  f"总帧数: {len(features_cat)}, 特征维度: {self.feature_dim}")
-            print(f"  窗口: {window_size}, 步长: {stride}, "
-                  f"样本数: {len(self.X)}")
+                  f"窗口: {total_windows}, 特征维度: {self.feature_dim}")
+            print(f"  窗口大小: {window_size}, 步长: {stride}")
             if total_imu > 0:
                 print(f"  GNSS 对齐: {total_matched}/{total_imu} "
                       f"({total_matched / total_imu:.1%})")
