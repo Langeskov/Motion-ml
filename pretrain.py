@@ -61,6 +61,10 @@ def parse_args():
     parser.add_argument("--block_size", type=int, default=10,
                         help="Block size for block mask strategy")
     parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--split_mode", type=str, default="session",
+                        choices=["session", "all"],
+                        help="session=只用训练会话做预训练(避免看到验证会话); "
+                             "all=使用全部会话")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--log_dir", type=str, default="runs/pretrain")
     parser.add_argument("--no_tensorboard", action="store_true")
@@ -81,6 +85,7 @@ def build_unlabeled_dataset(
     data_dir: str,
     window_size: int = 150,
     stride: int = 50,
+    only_sessions: list[str] = None,
 ):
     """
     构建无标签数据集 (V5 Session 管线)。
@@ -89,11 +94,20 @@ def build_unlabeled_dataset(
           → StandardScaler → 滑动窗口
     不使用 label 列 (自监督预训练不需要标签)。
 
+    Args:
+        only_sessions: 若提供, 只使用这些 session (避免预训练阶段看到验证会话)
+
     Returns:
         X: [num_samples, window_size, input_size]  numpy array
         scaler: fitted StandardScaler
     """
     sessions = SessionDataset(data_dir)
+    if only_sessions is not None:
+        want = set(only_sessions)
+        kept = [s for s in sessions.sessions if s.session_id in want]
+        print(f"[Pretrain] Session 过滤: {len(kept)}/{len(sessions.sessions)} "
+              f"(只用训练会话)")
+        sessions.sessions = kept
     print(sessions.summary())
 
     dataset = MotionWindowDataset(
@@ -164,9 +178,11 @@ def train_one_epoch(
             relative_error = abs_error / abs_target
 
             # 相对误差 < 10% 视为正确
+            # 注意: is_correct 与 mask_expanded 广播后是 [batch, seq, D] 元素计数,
+            # 分母必须同为元素数 (×D), 否则会出现 >100% 的假精度
             is_correct = (relative_error < 0.10).float() * mask_expanded
             correct_masked += is_correct.sum().item()
-            total_masked += mask_expanded.sum().item()
+            total_masked += mask_expanded.sum().item() * X_batch.shape[-1]
 
     avg_loss = total_loss / total_samples
     mask_accuracy = correct_masked / max(1, total_masked)
@@ -205,7 +221,7 @@ def validate(
         relative_error = abs_error / abs_target
         is_correct = (relative_error < 0.10).float() * mask_expanded
         correct_masked += is_correct.sum().item()
-        total_masked += mask_expanded.sum().item()
+        total_masked += mask_expanded.sum().item() * X_batch.shape[-1]
 
     avg_loss = total_loss / total_samples
     mask_accuracy = correct_masked / max(1, total_masked)
@@ -222,10 +238,29 @@ def main():
     print("=" * 60)
 
     # ── 1. 构建无标签数据集 ─────────────────────────
+    only_sessions = None
+    val_session_ids = []
+    if args.split_mode == "session":
+        from dataset.session_dataset import (
+            build_per_session_windows, session_level_split,
+        )
+        per = build_per_session_windows(
+            data_dir=args.data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+        )
+        tr_parts, va_parts, val_session_ids = session_level_split(
+            per, val_ratio=1.0 - args.train_ratio, seed=42
+        )
+        only_sessions = [p["session_id"] for p in tr_parts]
+        print(f"[Pretrain] 排除验证会话 {len(val_session_ids)} 个: "
+              f"{', '.join(val_session_ids)}")
+
     X, scaler = build_unlabeled_dataset(
         data_dir=args.data_dir,
         window_size=args.window_size,
         stride=args.stride,
+        only_sessions=only_sessions,
     )
     actual_input_size = X.shape[2]
 

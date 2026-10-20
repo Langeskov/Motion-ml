@@ -37,10 +37,18 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_recall_fscore_support,
 )
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.session_dataset import build_session_dataset, LABEL_MAP
+from dataset.session_dataset import (
+    build_session_dataset,
+    build_per_session_windows,
+    session_level_split,
+    concat_windows,
+    fit_scaler_on_windows,
+    apply_scaler_to_windows,
+    LABEL_MAP,
+)
 from models.motion_encoder import build_classifier
 
 
@@ -63,7 +71,14 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--split_mode", type=str, default="session",
+                        choices=["session", "window"],
+                        help="session=留出整段会话(可信评测, 默认); "
+                             "window=窗口级随机划分(存在时间泄漏)")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--select_metric", type=str, default="acc",
+                        choices=["acc", "macro_f1"],
+                        help="选择最优模型的指标 (数据不均衡时建议 macro_f1)")
     parser.add_argument("--log_dir", type=str, default=None)
     parser.add_argument("--no_tensorboard", action="store_true")
     return parser.parse_args()
@@ -259,23 +274,51 @@ def main():
     print("=" * 60)
 
     # ── 1. 构建有标签数据集 ─────────────────────────
-    dataset, scaler = build_session_dataset(
-        data_dir=args.data_dir,
-        window_size=args.window_size,
-        stride=args.stride,
-    )
-    actual_input_size = dataset.X.shape[2]
-    print(f"[Finetune] Detected input_size: {actual_input_size}")
+    if args.split_mode == "session":
+        per_session = build_per_session_windows(
+            data_dir=args.data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+        )
+        train_parts, val_parts, val_session_ids = session_level_split(
+            per_session, val_ratio=1.0 - args.train_ratio, seed=42,
+        )
+        trX_raw, trY = concat_windows(train_parts)
+        vaX_raw, vaY = concat_windows(val_parts)
 
-    # 划分训练/验证集
-    train_size = int(len(dataset) * args.train_ratio)
-    val_size = len(dataset) - train_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    print(f"[Finetune] Split: {train_size} train / {val_size} val")
+        scaler = fit_scaler_on_windows(trX_raw)
+        trX = apply_scaler_to_windows(scaler, trX_raw)
+        vaX = apply_scaler_to_windows(scaler, vaX_raw)
+        del trX_raw, vaX_raw
+
+        actual_input_size = trX.shape[2]
+        train_set = TensorDataset(torch.from_numpy(trX), torch.from_numpy(trY))
+        val_set = TensorDataset(torch.from_numpy(vaX), torch.from_numpy(vaY))
+
+        print(f"[Finetune] Split mode: session (无时间泄漏)")
+        print(f"[Finetune] 训练: {len(train_parts)} sessions / {len(trX):,} windows")
+        print(f"[Finetune] 验证: {len(val_parts)} sessions / {len(vaX):,} windows")
+        print(f"[Finetune] 验证会话: {', '.join(val_session_ids)}")
+    else:
+        dataset, scaler = build_session_dataset(
+            data_dir=args.data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+        )
+        actual_input_size = dataset.X.shape[2]
+
+        train_size = int(len(dataset) * args.train_ratio)
+        val_size = len(dataset) - train_size
+        train_set, val_set = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        val_session_ids = []
+        print(f"[Finetune] Split mode: window (警告: 验证集与训练集时间重叠)")
+        print(f"[Finetune] Split: {train_size} train / {val_size} val")
+
+    print(f"[Finetune] Detected input_size: {actual_input_size}")
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True
@@ -322,8 +365,18 @@ def main():
     # ── 4. 训练循环 ────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
+    best_score = -1.0
+    best_preds, best_labels = None, None
     total_train_time = 0.0
     criterion = nn.CrossEntropyLoss()
+
+    def _score(preds, labels):
+        if preds is None:
+            return None
+        if args.select_metric == "macro_f1":
+            from sklearn.metrics import f1_score
+            return float(f1_score(labels, preds, average="macro", zero_division=0))
+        return float((np.asarray(preds) == np.asarray(labels)).mean())
 
     # Phase 1: 冻结 Encoder，仅训练分类头
     if args.pretrained and args.warmup_epochs > 0:
@@ -364,6 +417,9 @@ def main():
     # Phase 2: 解冻 Encoder，端到端微调
     print(f"\n[Finetune] Phase 2: Fine-tuning ({args.epochs} epochs, encoder unfrozen)")
     model.unfreeze_encoder()
+    # Phase 2 重新开始记录最优 (warmup 的指标不作为选拔基准)
+    best_val_acc = 0.0
+    best_score = -1.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.finetune_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
@@ -402,9 +458,12 @@ def main():
             f"{scheduler.get_last_lr()[0]:9.2e} | {elapsed:5.1f}s"
         )
 
-        # 保存最优模型
-        if val_acc > best_val_acc:
+        # 保存最优模型 (按 select_metric 选择)
+        score = _score(val_preds, val_labels)
+        if score > best_score:
+            best_score = score
             best_val_acc = val_acc
+            best_preds, best_labels = val_preds, val_labels
             save_path = os.path.join(args.save_dir, "motion_classifier.pth")
             torch.save(
                 {
@@ -417,6 +476,8 @@ def main():
                     "scaler_mean": scaler.mean_.tolist(),
                     "scaler_scale": scaler.scale_.tolist(),
                     "input_size": actual_input_size,
+                    "split_mode": args.split_mode,
+                    "val_session_ids": val_session_ids,
                     "args": vars(args),
                 },
                 save_path,
@@ -435,6 +496,8 @@ def main():
             "scaler_mean": scaler.mean_.tolist(),
             "scaler_scale": scaler.scale_.tolist(),
             "input_size": actual_input_size,
+            "split_mode": args.split_mode,
+            "val_session_ids": val_session_ids,
             "args": vars(args),
         },
         final_path,
@@ -450,8 +513,8 @@ def main():
         best_val_acc=best_val_acc,
         total_train_time=total_train_time,
         epochs=args.epochs,
-        val_preds=val_preds,
-        val_labels=val_labels,
+        val_preds=best_preds if best_preds is not None else val_preds,
+        val_labels=best_labels if best_labels is not None else val_labels,
     )
 
     # 保存 metrics

@@ -111,6 +111,7 @@ class MotionWindowDataset(Dataset):
         rolling_window: int = 10,
         max_gap_ms: float = 2000.0,
         builder: Optional[FeatureBuilder] = None,
+        drop_features: Optional[list[str]] = None,
         verbose: bool = True,
     ):
         if isinstance(sessions, SessionDataset):
@@ -122,6 +123,7 @@ class MotionWindowDataset(Dataset):
             builder = FeatureBuilder()
 
         self.feature_map = builder.feature_map  # 暴露给下游
+        self.drop_features = list(drop_features) if drop_features else []
 
         aligner = TimeAligner(max_gap_ms=max_gap_ms)
         extractor = FeatureExtractor(rolling_window=rolling_window)
@@ -163,8 +165,11 @@ class MotionWindowDataset(Dataset):
             # Step C: FeatureExtractor — 基础特征 → 派生特征
             clean_df = extractor.transform(clean_df)
 
-            # 提取特征列
-            feature_cols = [c for c in extractor.ALL_COLS if c in clean_df.columns]
+            # 提取特征列 (可剔除与任务无关/依赖设备的特征, 如绝对姿态角)
+            feature_cols = [
+                c for c in extractor.ALL_COLS
+                if c in clean_df.columns and c not in self.drop_features
+            ]
             feat = clean_df[feature_cols].values.astype(np.float32)
             labels = clean_df["label"].map(LABEL_MAP).values
 
@@ -253,6 +258,8 @@ def build_session_dataset(
     rolling_window: int = 10,
     max_gap_ms: float = 2000.0,
     builder: Optional[FeatureBuilder] = None,
+    repair_timestamps: bool = True,
+    drop_features: Optional[list[str]] = None,
 ) -> tuple[MotionWindowDataset, StandardScaler]:
     """
     一站式构建数据集。
@@ -273,7 +280,7 @@ def build_session_dataset(
     Returns:
         (MotionWindowDataset, fitted scaler)
     """
-    ds = SessionDataset(data_dir)
+    ds = SessionDataset(data_dir, repair_timestamps=repair_timestamps)
     print(ds.summary())
 
     dataset = MotionWindowDataset(
@@ -285,6 +292,165 @@ def build_session_dataset(
         rolling_window=rolling_window,
         max_gap_ms=max_gap_ms,
         builder=builder,
+        drop_features=drop_features,
     )
 
     return dataset, dataset.scaler
+
+
+# ══════════════════════════════════════════════════════════════
+# Session 级划分 (可信评测协议)
+# ══════════════════════════════════════════════════════════════
+#
+# 为什么必须按 Session 划分:
+#   滑动窗口 stride=50 < window=150, 相邻窗口共享 100/150 帧。
+#   窗口级 random_split 会让验证窗口与训练窗口在同一段采集数据上重叠,
+#   实测泄漏率 99.84%, 验证指标退化为"训练集精度"。
+#
+#   Session 级划分 = 留出整段采集, 验证集是模型从未见过的数据。
+
+
+def build_per_session_windows(
+    data_dir: str = "data/raw",
+    window_size: int = 150,
+    stride: int = 50,
+    rolling_window: int = 10,
+    max_gap_ms: float = 2000.0,
+    builder: Optional[FeatureBuilder] = None,
+    repair_timestamps: bool = True,
+    drop_features: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    逐 Session 构建窗口 (未标准化), 返回会话级窗口列表。
+
+    用于 Session 级训练/验证划分: 标准化参数只能在训练会话上拟合。
+
+    Returns:
+        [{"session_id": str, "label": str, "label_id": int,
+          "X": [n, window, D], "Y": [n], "n_frames": int}, ...]
+    """
+    ds = SessionDataset(data_dir, verbose=False,
+                        repair_timestamps=repair_timestamps)
+    out = []
+
+    # 先探出特征维度, 再构造恒等 scaler (不改变数值, 只绕过未拟合检查)
+    probe_session = ds.sessions[0]
+    probe = MotionWindowDataset(
+        sessions=[probe_session], window_size=window_size, stride=stride,
+        rolling_window=rolling_window, max_gap_ms=max_gap_ms, builder=builder,
+        drop_features=drop_features,
+        verbose=False,
+    )
+    dim = probe.feature_dim
+    ident = StandardScaler()
+    ident.mean_ = np.zeros(dim)
+    ident.scale_ = np.ones(dim)
+    ident.var_ = np.ones(dim)
+    ident.n_features_in_ = dim
+
+    for s in ds.sessions:
+        label_id = LABEL_MAP.get(s.label.upper().strip(), -1)
+        if label_id < 0:
+            print(f"  [跳过] {s.session_id}: 未知标签 '{s.label}'")
+            continue
+        d = MotionWindowDataset(
+            sessions=[s], window_size=window_size, stride=stride,
+            scaler=ident, fit_scaler=False,
+            rolling_window=rolling_window, max_gap_ms=max_gap_ms, builder=builder,
+            drop_features=drop_features,
+            verbose=False,
+        )
+        if len(d.X) == 0:
+            print(f"  [跳过] {s.session_id}: 帧数不足 {window_size}")
+            continue
+        out.append({
+            "session_id": s.session_id,
+            "label": s.label,
+            "label_id": label_id,
+            "X": d.X,
+            "Y": d.Y,
+            "n_frames": len(d.X),
+        })
+
+    if not out:
+        raise ValueError("没有可用的 Session (全部帧数不足或标签无效)")
+    return out
+
+
+def session_level_split(
+    per_session: list[dict],
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """
+    按 Session 分组划分训练/验证集, 每类至少留出 1 个会话。
+
+    策略: 每类内按窗口数 **从小到大** 依次放入验证集, 直到该类的验证窗口
+    占比达到 val_ratio。这样大会话(通常信息量更丰富)优先留给训练集,
+    同时验证集比例接近目标。
+    该类只有 1 个会话时无法留出, 全部进训练集。
+
+    Returns:
+        (train_parts, val_parts, val_session_ids)
+    """
+    rng = np.random.RandomState(seed)
+    by_label: dict[int, list[dict]] = {}
+    for p in per_session:
+        by_label.setdefault(p["label_id"], []).append(p)
+
+    train_parts, val_parts = [], []
+    for label_id in sorted(by_label):
+        group = by_label[label_id]
+
+        if len(group) == 1:
+            train_parts.extend(group)
+            print(f"  [警告] 类别 {group[0]['label']} 只有 1 个会话, 无法留出验证集")
+            continue
+
+        # 从小到大; 同尺寸时用 seed 打散, 保证可复现且不总选同一个
+        jitter = rng.rand(len(group))
+        order = np.lexsort((jitter, [p["X"].shape[0] for p in group]))
+        group = [group[i] for i in order]
+
+        total_win = sum(p["X"].shape[0] for p in group)
+        target = total_win * val_ratio
+
+        # 在所有"由小到大累加"的前缀中, 选窗口数最接近目标的一个。
+        # 不能简单地"加到超过目标就停": 若下一个会话很大, 会严重过冲
+        # (实测 CAR 会从 19% 直接跳到 46%)。
+        best_n, best_gap = 1, None
+        acc = 0
+        for n, p in enumerate(group[:-1], start=1):   # 至少留 1 个会话给训练
+            acc += p["X"].shape[0]
+            gap = abs(acc - target)
+            if best_gap is None or gap < best_gap:
+                best_gap, best_n = gap, n
+
+        held = group[:best_n]
+        held_ids = {p["session_id"] for p in held}
+        val_parts.extend(held)
+        train_parts.extend(p for p in group if p["session_id"] not in held_ids)
+
+    val_ids = [p["session_id"] for p in val_parts]
+    return train_parts, val_parts, val_ids
+
+
+def fit_scaler_on_windows(X: np.ndarray) -> StandardScaler:
+    """只在给定窗口上拟合标准化参数 (避免验证集信息泄漏)。"""
+    sc = StandardScaler()
+    sc.fit(X.reshape(-1, X.shape[-1]))
+    return sc
+
+
+def apply_scaler_to_windows(scaler: StandardScaler, X: np.ndarray) -> np.ndarray:
+    """应用标准化, 保持 [n, window, D] 形状。"""
+    shp = X.shape
+    out = scaler.transform(X.reshape(-1, shp[-1]))
+    return out.reshape(shp).astype(np.float32)
+
+
+def concat_windows(parts: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """拼接会话窗口列表为 (X, Y)。"""
+    X = np.concatenate([p["X"] for p in parts], axis=0)
+    Y = np.concatenate([p["Y"] for p in parts], axis=0)
+    return X, Y

@@ -30,10 +30,18 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_recall_fscore_support,
 )
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.session_dataset import build_session_dataset, LABEL_MAP
+from dataset.session_dataset import (
+    build_session_dataset,
+    build_per_session_windows,
+    session_level_split,
+    concat_windows,
+    fit_scaler_on_windows,
+    apply_scaler_to_windows,
+    LABEL_MAP,
+)
 from models import build_model_by_type, MODEL_TYPES
 
 
@@ -52,7 +60,20 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--split_mode", type=str, default="session",
+                        choices=["session", "window"],
+                        help="session=留出整段会话(可信评测, 默认); "
+                             "window=窗口级随机划分(存在时间泄漏, 仅用于冒烟测试)")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--select_metric", type=str, default="acc",
+                        choices=["acc", "macro_f1"],
+                        help="选择最优模型的指标。数据不均衡时建议 macro_f1"
+                             " (accuracy 会被占比最大的类主导)")
+    parser.add_argument("--class_weight", action="store_true",
+                        help="按类别频率反比加权 CrossEntropyLoss (缓解类别不均衡)")
+    parser.add_argument("--drop_features", type=str, default="",
+                        help="逗号分隔的待剔除特征名, 如 'yaw,pitch,roll'。"
+                             "绝对姿态角依赖手机朝向, 跨会话泛化差")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="TensorBoard log dir (default: runs/<model_type>)")
     parser.add_argument("--no_tensorboard", action="store_true")
@@ -323,29 +344,65 @@ def main():
     args = parse_args()
     device = get_device()
 
-    # ── 1. 构建数据集 ─────────────────────────────────
+    # ── 1. 构建数据集 & 2. 划分训练/验证集 ─────────────
     print("\n" + "=" * 60)
-    print(f"  Motion Model Training V4 ({args.model.upper()})")
+    print(f"  Motion Model Training V5 ({args.model.upper()})")
     print("=" * 60)
 
-    dataset, scaler = build_session_dataset(
-        data_dir=args.data_dir,
-        window_size=args.window_size,
-        stride=args.stride,
-    )
+    drop_features = [s.strip() for s in args.drop_features.split(",") if s.strip()]
 
-    actual_input_size = dataset.X.shape[2]
+    if args.split_mode == "session":
+        # 可信协议: 留出整段会话, 验证集与训练集无时间重叠
+        per_session = build_per_session_windows(
+            data_dir=args.data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+            drop_features=drop_features,
+        )
+        train_parts, val_parts, val_session_ids = session_level_split(
+            per_session,
+            val_ratio=1.0 - args.train_ratio,
+            seed=42,
+        )
+        trX_raw, trY = concat_windows(train_parts)
+        vaX_raw, vaY = concat_windows(val_parts)
+
+        # 标准化参数只在训练会话上拟合
+        scaler = fit_scaler_on_windows(trX_raw)
+        trX = apply_scaler_to_windows(scaler, trX_raw)
+        vaX = apply_scaler_to_windows(scaler, vaX_raw)
+        del trX_raw, vaX_raw
+
+        actual_input_size = trX.shape[2]
+        train_set = TensorDataset(torch.from_numpy(trX), torch.from_numpy(trY))
+        val_set = TensorDataset(torch.from_numpy(vaX), torch.from_numpy(vaY))
+
+        print(f"[Train] Split mode: session (无时间泄漏)")
+        print(f"[Train] 训练: {len(train_parts)} sessions / {len(trX):,} windows")
+        print(f"[Train] 验证: {len(val_parts)} sessions / {len(vaX):,} windows")
+        print(f"[Train] 验证会话: {', '.join(val_session_ids)}")
+    else:
+        # 兼容旧行为 (窗口级 random_split, 存在 ~99.8% 泄漏, 仅用于冒烟测试)
+        dataset, scaler = build_session_dataset(
+            data_dir=args.data_dir,
+            window_size=args.window_size,
+            stride=args.stride,
+            drop_features=drop_features,
+        )
+        actual_input_size = dataset.X.shape[2]
+
+        train_size = int(len(dataset) * args.train_ratio)
+        val_size = len(dataset) - train_size
+        train_set, val_set = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        val_session_ids = []
+        print(f"[Train] Split mode: window (警告: 验证集与训练集时间重叠)")
+        print(f"[Train] Split: {train_size} train / {val_size} val")
+
     print(f"[Train] Detected input_size: {actual_input_size}")
-
-    # ── 2. 划分训练/验证集 ────────────────────────────
-    train_size = int(len(dataset) * args.train_ratio)
-    val_size = len(dataset) - train_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    print(f"[Train] Split: {train_size} train / {val_size} val")
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, drop_last=False
@@ -364,7 +421,22 @@ def main():
         dropout=args.dropout,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # 损失函数: 可选类别加权 (缓解 CAR 占比 55% 的失衡)
+    if args.class_weight:
+        if args.split_mode == "session":
+            counts = np.bincount(trY, minlength=len(LABEL_MAP)).astype(np.float64)
+        else:
+            counts = np.bincount(dataset.Y, minlength=len(LABEL_MAP)).astype(np.float64)
+        counts[counts == 0] = 1.0
+        weights = counts.sum() / (len(LABEL_MAP) * counts)
+        criterion = nn.CrossEntropyLoss(
+            weight=torch.tensor(weights, dtype=torch.float32, device=device)
+        )
+        inv_map = {v: k for k, v in LABEL_MAP.items()}
+        print("[Train] Class weights: " + ", ".join(
+            f"{inv_map[i]}={weights[i]:.2f}" for i in range(len(LABEL_MAP))))
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # ── 4. TensorBoard ───────────────────────────────
@@ -391,7 +463,15 @@ def main():
     # ── 5. 训练循环 ──────────────────────────────────
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
+    best_score = -1.0
+    best_preds, best_labels = None, None
     total_train_time = 0.0
+
+    def _score(preds, labels):
+        if args.select_metric == "macro_f1":
+            from sklearn.metrics import f1_score
+            return float(f1_score(labels, preds, average="macro", zero_division=0))
+        return float((np.asarray(preds) == np.asarray(labels)).mean())
 
     print(f"\n{'Epoch':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
           f"{'Val Loss':>8} | {'Val Acc':>7} | {'Time':>6}")
@@ -409,6 +489,8 @@ def main():
 
         elapsed = time.time() - t0
         total_train_time += elapsed
+
+        score = _score(val_preds, val_labels)
 
         # ── TensorBoard 日志 ─────────────────────────
         if writer:
@@ -432,9 +514,11 @@ def main():
             f"{val_loss:8.4f} | {val_acc:6.1%} | {elapsed:5.1f}s"
         )
 
-        # 保存最优模型
-        if val_acc > best_val_acc:
+        # 保存最优模型 (按 select_metric 选择)
+        if score > best_score:
+            best_score = score
             best_val_acc = val_acc
+            best_preds, best_labels = val_preds, val_labels
             save_path = os.path.join(args.save_dir, f"best_{args.model}.pth")
             torch.save(
                 {
@@ -447,6 +531,8 @@ def main():
                     "scaler_mean": scaler.mean_.tolist(),
                     "scaler_scale": scaler.scale_.tolist(),
                     "input_size": actual_input_size,
+                    "split_mode": args.split_mode,
+                    "val_session_ids": val_session_ids,
                     "args": vars(args),
                 },
                 save_path,
@@ -486,8 +572,8 @@ def main():
         best_val_acc=best_val_acc,
         total_train_time=total_train_time,
         epochs=args.epochs,
-        val_preds=val_preds,
-        val_labels=val_labels,
+        val_preds=best_preds if best_preds is not None else val_preds,
+        val_labels=best_labels if best_labels is not None else val_labels,
     )
 
     # 保存 metrics 到 JSON

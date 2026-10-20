@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -140,21 +141,76 @@ def scan_sessions(data_dir: str) -> list[SessionInfo]:
 
 # ── 数据清洗 ────────────────────────────────────────────────
 
-def _clean_imu(df: pd.DataFrame) -> pd.DataFrame:
+def repair_duplicate_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    修复重复 timestamp 的 IMU 数据。
+
+    背景: 采集端在缓冲区积压时会一次性写入多条样本, 它们共享同一个时间戳,
+    但传感器值是**真实且互不相同**的采样 (实测 330 条同一时间戳对应 330 组不同
+    加速度值)。因此这些行不是重复数据, 直接丢弃会损失大量真实样本
+    (实测全库共 22.1% 的行受影响)。
+
+    修复方式: 对每个时间戳组内的 k 行, 按行序在 [t, t+gap) 区间内等间隔展开,
+    其中 gap 为该时间戳到下一个唯一时间戳的间隔。
+      - 保证 timestamp 严格递增
+      - 不越过下一个唯一时间戳 (不破坏全局时序)
+      - 保留全部样本, 顺序不变
+
+    局限: 无法恢复真实采样时刻, 只能保证顺序和局部区间正确。根治需要修采集端。
+
+    Args:
+        df: 含 'timestamp' 列的 IMU DataFrame
+
+    Returns:
+        修复后的 DataFrame (已按 timestamp 排序)
+    """
+    if "timestamp" not in df.columns:
+        return df
+    if df["timestamp"].is_unique:
+        return df.sort_values("timestamp").reset_index(drop=True)
+
+    ts = df["timestamp"].to_numpy(dtype=np.float64)
+
+    # 组内序号 (0-based) 与组大小
+    grp = df.groupby("timestamp", sort=False)
+    rank = grp.cumcount().to_numpy()
+    size = grp["timestamp"].transform("size").to_numpy()
+
+    # 每个唯一时间戳 → 到下一个唯一时间戳的间隔
+    uniq = np.unique(ts)
+    gaps = np.diff(uniq)
+    med_gap = float(np.median(gaps)) if len(gaps) else 20.0
+    gap_of = dict(zip(uniq[:-1].tolist(), gaps.tolist()))
+    gap_arr = np.array([gap_of.get(t, med_gap) for t in ts], dtype=np.float64)
+
+    # 组内第 i 个偏移 i/k * gap ∈ [0, gap) —— 严格小于 gap, 不会跨过下一个时间戳
+    frac = rank / np.maximum(size, 1).astype(np.float64)
+    out = df.copy()
+    out["timestamp"] = ts + frac * gap_arr
+
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+def _clean_imu(df: pd.DataFrame, repair_timestamps: bool = True) -> pd.DataFrame:
     """
     IMU 数据清洗:
-    1. 删除重复 timestamp (保留最后一条)
-    2. 按 timestamp 排序
-    3. 前向填充 + 后向填充缺失值
-    4. 删除仍残留 NaN 的行
+    0. 修复重复 timestamp (repair_timestamps=True 时) 或直接去重
+    1. 按 timestamp 排序
+    2. 前向填充 + 后向填充缺失值
+    3. 删除仍残留 NaN 的行
     """
     before = len(df)
 
-    # 去重: 同一 timestamp 可能因传感器回调重复
-    df = df.drop_duplicates(subset=["timestamp"], keep="last")
-
-    # 排序
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    n_dup = len(df) - df["timestamp"].nunique()
+    if repair_timestamps:
+        # 保留全部真实采样, 只修复时间戳
+        df = repair_duplicate_timestamps(df)
+        if n_dup > 0:
+            print(f"  [IMU]  timestamp 修复: {n_dup} 行 ({n_dup/before:.1%}) 共享时间戳, 已展开")
+    else:
+        # 旧行为: 每个重复时间戳只保留最后一行 (会丢弃真实样本)
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        df = df.sort_values("timestamp").reset_index(drop=True)
 
     # 填充传感器列
     sensor_cols = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z",
@@ -207,10 +263,10 @@ def _clean_gnss(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── 加载 ────────────────────────────────────────────────────
 
-def _load_imu(path: str) -> pd.DataFrame:
+def _load_imu(path: str, repair_timestamps: bool = True) -> pd.DataFrame:
     """加载并清洗 IMU CSV。"""
     df = pd.read_csv(path)
-    df = _clean_imu(df)
+    df = _clean_imu(df, repair_timestamps=repair_timestamps)
     return df
 
 
@@ -223,17 +279,18 @@ def _load_gnss(path: Optional[str]) -> pd.DataFrame:
     return df
 
 
-def load_session(info: SessionInfo) -> Session:
+def load_session(info: SessionInfo, repair_timestamps: bool = True) -> Session:
     """
     根据 SessionInfo 加载一个完整 Session。
 
     Args:
         info: 扫描阶段生成的元数据
+        repair_timestamps: 是否修复重复时间戳 (False=旧行为, 直接丢弃重复行)
 
     Returns:
         包含 imu/gnss DataFrame 的 Session 对象
     """
-    imu_df = _load_imu(info.imu_path)
+    imu_df = _load_imu(info.imu_path, repair_timestamps=repair_timestamps)
     gnss_df = _load_gnss(info.gnss_path)
 
     return Session(
@@ -262,11 +319,14 @@ class SessionDataset:
     Args:
         data_dir:  数据目录
         verbose:   是否打印加载日志
+        repair_timestamps: 是否修复重复时间戳 (默认 True)
     """
 
-    def __init__(self, data_dir: str, verbose: bool = True):
+    def __init__(self, data_dir: str, verbose: bool = True,
+                 repair_timestamps: bool = True):
         self.data_dir = data_dir
         self.verbose = verbose
+        self.repair_timestamps = repair_timestamps
 
         # 扫描
         infos = scan_sessions(data_dir)
@@ -276,7 +336,7 @@ class SessionDataset:
         # 加载
         self.sessions: list[Session] = []
         for info in infos:
-            session = load_session(info)
+            session = load_session(info, repair_timestamps=self.repair_timestamps)
             self.sessions.append(session)
             if verbose:
                 gnss_status = f"gnss={len(session.gnss)}" if len(session.gnss) > 0 else "gnss=无"
