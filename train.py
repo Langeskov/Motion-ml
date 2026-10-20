@@ -74,6 +74,16 @@ def parse_args():
     parser.add_argument("--drop_features", type=str, default="",
                         help="逗号分隔的待剔除特征名, 如 'yaw,pitch,roll'。"
                              "绝对姿态角依赖手机朝向, 跨会话泛化差")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="Adam 的 L2 正则系数 (0=关闭, 建议 1e-4)")
+    parser.add_argument("--augment", action="store_true",
+                        help="开启训练数据增强 (幅度缩放 + 高斯抖动 + 时间平移)")
+    parser.add_argument("--aug_jitter", type=float, default=0.01,
+                        help="增强: 高斯抖动标准差 (标准化空间)")
+    parser.add_argument("--aug_shift", type=int, default=5,
+                        help="增强: 时间平移最大帧数 (±)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="随机种子 (影响权重初始化、shuffle、数据增强)")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="TensorBoard log dir (default: runs/<model_type>)")
     parser.add_argument("--no_tensorboard", action="store_true")
@@ -93,12 +103,48 @@ def get_device() -> torch.device:
     return dev
 
 
+def augment_batch(
+    x: torch.Tensor,
+    jitter: float = 0.01,
+    scale_range: tuple[float, float] = (0.95, 1.05),
+    shift_max: int = 5,
+) -> torch.Tensor:
+    """
+    时序传感器数据增强 (只在训练时使用)。
+
+      - 幅度缩放: 每个样本乘 U(scale_range), 模拟不同设备增益/佩戴松紧
+      - 高斯抖动: 加 N(0, jitter²), 模拟传感器噪声
+      - 时间平移: 沿时间轴循环平移 ±shift_max 帧, 打散窗口相位
+
+    输入已标准化, 所以 jitter 取小值 (0.01 约等于 0.01 个标准差)。
+    """
+    B, T, D = x.shape
+
+    if scale_range is not None and scale_range != (1.0, 1.0):
+        s = torch.empty(B, 1, 1, device=x.device).uniform_(*scale_range)
+        x = x * s
+
+    if jitter > 0:
+        x = x + torch.randn_like(x) * jitter
+
+    if shift_max > 0:
+        shifts = torch.randint(-shift_max, shift_max + 1, (B,), device=x.device)
+        idx = (torch.arange(T, device=x.device).unsqueeze(0) + shifts.unsqueeze(1)) % T
+        x = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, D))
+
+    return x
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    augment: bool = False,
+    aug_jitter: float = 0.01,
+    aug_scale: tuple[float, float] = (0.95, 1.05),
+    aug_shift: int = 5,
 ) -> tuple[float, float]:
     """训练一个 epoch，返回 (平均loss, accuracy)。"""
     model.train()
@@ -109,6 +155,12 @@ def train_one_epoch(
     for X_batch, Y_batch in loader:
         X_batch = X_batch.to(device)
         Y_batch = Y_batch.to(device)
+
+        if augment:
+            X_batch = augment_batch(
+                X_batch, jitter=aug_jitter,
+                scale_range=aug_scale, shift_max=aug_shift,
+            )
 
         optimizer.zero_grad()
         logits = model(X_batch)
@@ -344,6 +396,13 @@ def main():
     args = parse_args()
     device = get_device()
 
+    # 固定随机种子 (权重初始化 / shuffle / 数据增强), 保证可复现
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"[Train] seed={args.seed}")
+
     # ── 1. 构建数据集 & 2. 划分训练/验证集 ─────────────
     print("\n" + "=" * 60)
     print(f"  Motion Model Training V5 ({args.model.upper()})")
@@ -437,7 +496,13 @@ def main():
             f"{inv_map[i]}={weights[i]:.2f}" for i in range(len(LABEL_MAP))))
     else:
         criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
+                                 weight_decay=args.weight_decay)
+    if args.weight_decay > 0:
+        print(f"[Train] weight_decay={args.weight_decay}")
+    if args.augment:
+        print(f"[Train] augmentation: jitter={args.aug_jitter}, "
+              f"scale=0.95~1.05, time_shift=±{args.aug_shift}")
 
     # ── 4. TensorBoard ───────────────────────────────
     log_dir = args.log_dir or f"runs/{args.model}"
@@ -464,6 +529,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
     best_score = -1.0
+    best_epoch = 0
     best_preds, best_labels = None, None
     total_train_time = 0.0
 
@@ -481,7 +547,10 @@ def main():
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device,
+            augment=args.augment,
+            aug_jitter=args.aug_jitter,
+            aug_shift=args.aug_shift,
         )
         val_loss, val_acc, val_preds, val_labels = validate(
             model, val_loader, criterion, device
@@ -518,6 +587,7 @@ def main():
         if score > best_score:
             best_score = score
             best_val_acc = val_acc
+            best_epoch = epoch
             best_preds, best_labels = val_preds, val_labels
             save_path = os.path.join(args.save_dir, f"best_{args.model}.pth")
             torch.save(
@@ -540,6 +610,10 @@ def main():
             print(f"  -> Saved best model (val_acc={val_acc:.1%})")
 
     # ── 6. 保存最终模型 ──────────────────────────────
+    if best_epoch:
+        print(f"\n[Train] 最优 epoch: {best_epoch}/{args.epochs}  "
+              f"(按 {args.select_metric}); 早停可省 {args.epochs - best_epoch} 轮 "
+              f"({(args.epochs - best_epoch) / args.epochs:.0%})")
     final_path = os.path.join(args.save_dir, f"final_{args.model}.pth")
     torch.save(
         {
@@ -550,6 +624,8 @@ def main():
             "scaler_mean": scaler.mean_.tolist(),
             "scaler_scale": scaler.scale_.tolist(),
             "input_size": actual_input_size,
+            "split_mode": args.split_mode,
+            "val_session_ids": val_session_ids,
             "args": vars(args),
         },
         final_path,
