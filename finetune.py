@@ -83,6 +83,8 @@ def parse_args():
     parser.add_argument("--select_metric", type=str, default="acc",
                         choices=["acc", "macro_f1"],
                         help="选择最优模型的指标 (数据不均衡时建议 macro_f1)")
+    parser.add_argument("--early_stop_patience", type=int, default=10,
+                        help="早停: 指标连续 N 轮无提升就停止 (0=关闭)")
     parser.add_argument("--log_dir", type=str, default=None)
     parser.add_argument("--no_tensorboard", action="store_true")
     return parser.parse_args()
@@ -426,6 +428,8 @@ def main():
     # Phase 2 重新开始记录最优 (warmup 的指标不作为选拔基准)
     best_val_acc = 0.0
     best_score = -1.0
+    best_state = None
+    epochs_no_improve = 0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.finetune_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
@@ -469,7 +473,9 @@ def main():
         if score > best_score:
             best_score = score
             best_val_acc = val_acc
+            epochs_no_improve = 0
             best_preds, best_labels = val_preds, val_labels
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             save_path = os.path.join(args.save_dir, "motion_classifier.pth")
             torch.save(
                 {
@@ -489,12 +495,24 @@ def main():
                 save_path,
             )
             print(f"  -> Saved best classifier (val_acc={val_acc:.1%})")
+        else:
+            epochs_no_improve += 1
+            if (args.early_stop_patience > 0
+                    and epochs_no_improve >= args.early_stop_patience):
+                print(f"  [早停] {args.early_stop_patience} 轮无提升, 在 epoch {epoch} 停止")
+                break
+
+    # 恢复到最优权重 (早停时最后一轮通常已过拟合)
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     # ── 5. 保存最终模型 ────────────────────────────
+    ran_epochs = epoch
     final_path = os.path.join(args.save_dir, "motion_classifier_final.pth")
     torch.save(
         {
-            "epoch": args.epochs,
+            "epoch": ran_epochs,
+            "ran_epochs": ran_epochs,
             "model_type": "motion_classifier",
             "model_state_dict": model.state_dict(),
             "encoder_state_dict": model.encoder.state_dict(),
@@ -518,7 +536,7 @@ def main():
         model=model,
         best_val_acc=best_val_acc,
         total_train_time=total_train_time,
-        epochs=args.epochs,
+        epochs=ran_epochs,
         val_preds=best_preds if best_preds is not None else val_preds,
         val_labels=best_labels if best_labels is not None else val_labels,
     )

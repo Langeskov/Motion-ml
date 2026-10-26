@@ -151,6 +151,45 @@ python evaluate.py --checkpoint ... --all
 - 结论：重采样修掉了一个真实缺陷（时间尺度不一致），代价是 WALKING 的 F1 下滑，
   净效应在噪声内。保留重采样是出于**正确性**而非精度，同时顺带获得 3 倍加速。
 
+### Session 级 K 折交叉验证（当前最可信的评估）
+
+单次留出划分的问题是：macro F1 里每一类其实只由 1~2 个会话决定，换个划分就大幅跳动。
+改成按会话分 K 折后，每类会话轮流做验证集，**所有会话都被评到恰好一次**，
+每类指标建立在全部会话之上。
+
+```bash
+python cv.py --folds 3 --target_hz 50 --drop_features yaw,pitch,roll
+```
+
+3 折袋外（out-of-fold）结果，23,178 个样本：
+
+| 类别 | F1 | support（窗口数） |
+|------|-----|------------------:|
+| STATIONARY | 0.587 | 1,073 |
+| WALKING | 0.476 | 2,233 |
+| CYCLING | 0.519 | 1,824 |
+| CAR | 0.912 | 14,017 |
+| TRAIN | 0.814 | 4,031 |
+| **总体** | **Accuracy 0.812 / Macro F1 0.662** | 23,178 |
+
+主要混淆（行=真实）：
+
+| 真实 → 误判 | 数量 | 占该类 |
+|-------------|-----:|-------:|
+| TRAIN → STATIONARY | 760 | 18.9% |
+| CYCLING → CAR | 834 | 45.7% |
+| CAR → CYCLING | 530 | 3.8% |
+| WALKING → CAR | 576 | 25.8% |
+| WALKING → TRAIN | 478 | 21.4% |
+
+要点：
+
+- **OOF macro F1 0.662 低于单次划分的 0.679~0.690** —— 说明单次划分的结果偏乐观，
+  它恰好抽到了比较好评的会话组合。以 0.662 作为当前真实水平的基准。
+- CYCLING 与 CAR 的双向混淆是最大问题（45.7% 的骑行被判成汽车）。
+- 开早停后 3 折总共只花 **136 秒**（每折最优 epoch 分别为 14/14/1），
+  所以现在做多种子、多模型的对比变得很便宜。
+
 ## 已知数据问题
 
 - **IMU 时间戳重复**：23 个会话全部存在，合计 22.1% 的行与其他行共享同一 `timestamp`，
@@ -259,6 +298,7 @@ motion-ml/
 ├── pretrain.py              # Stage 1: Masked Sensor Modeling 预训练
 ├── finetune.py              # Stage 2: 有监督微调
 ├── evaluate.py              # 模型评估
+├── cv.py                    # Session 级 K 折交叉验证 (推荐的可信评估)
 ├── export.py                # 导出 .pth / ONNX
 ├── test_v5_pipeline.py      # 管线完整性测试
 ├── dataset/

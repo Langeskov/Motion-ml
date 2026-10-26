@@ -98,6 +98,12 @@ def parse_args():
                         help="增强: 时间平移最大帧数 (±)")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子 (影响权重初始化、shuffle、数据增强)")
+    parser.add_argument("--early_stop_patience", type=int, default=10,
+                        help="早停: select_metric 连续 N 轮没有提升就停止 (0=关闭)。"
+                             "实测最优 epoch 常落在第 2~31 轮, 开早停可省 50%%~95%% 训练时间")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="强制 cuDNN 确定性算法。同种子可复现, 但会慢一些。"
+                             "实测同种子两次运行的 val_acc 可差 2.5pt (GPU 非确定性)")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="TensorBoard log dir (default: runs/<model_type>)")
     parser.add_argument("--no_tensorboard", action="store_true")
@@ -415,6 +421,11 @@ def main():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    if args.deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        print("[Train] deterministic mode ON (较慢, 但同种子可复现)")
     print(f"[Train] seed={args.seed}")
 
     # ── 1. 构建数据集 & 2. 划分训练/验证集 ─────────────
@@ -562,6 +573,8 @@ def main():
     best_score = -1.0
     best_epoch = 0
     best_preds, best_labels = None, None
+    best_state = None
+    epochs_no_improve = 0
     total_train_time = 0.0
 
     def _score(preds, labels):
@@ -619,7 +632,10 @@ def main():
             best_score = score
             best_val_acc = val_acc
             best_epoch = epoch
+            epochs_no_improve = 0
             best_preds, best_labels = val_preds, val_labels
+            # 记住最优权重, 训练结束后恢复 (早停时模型已不在最优点)
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             save_path = os.path.join(args.save_dir, f"best_{args.model}.pth")
             torch.save(
                 {
@@ -638,17 +654,32 @@ def main():
                 },
                 save_path,
             )
-            print(f"  -> Saved best model (val_acc={val_acc:.1%})")
+            print(f"  -> Saved best model (val_acc={val_acc:.1%}, "
+                  f"{args.select_metric}={score:.4f})")
+        else:
+            epochs_no_improve += 1
+            if (args.early_stop_patience > 0
+                    and epochs_no_improve >= args.early_stop_patience):
+                print(f"  [早停] {args.early_stop_patience} 轮无提升, "
+                      f"在 epoch {epoch} 停止 (最优 epoch={best_epoch})")
+                break
+
+    # 恢复到最优权重 (早停时最后一轮通常已过拟合)
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     # ── 6. 保存最终模型 ──────────────────────────────
+    ran_epochs = epoch
     if best_epoch:
         print(f"\n[Train] 最优 epoch: {best_epoch}/{args.epochs}  "
-              f"(按 {args.select_metric}); 早停可省 {args.epochs - best_epoch} 轮 "
-              f"({(args.epochs - best_epoch) / args.epochs:.0%})")
+              f"(按 {args.select_metric}); 实际训练 {ran_epochs} 轮, "
+              f"省下 {args.epochs - ran_epochs} 轮 "
+              f"({(args.epochs - ran_epochs) / args.epochs:.0%})")
     final_path = os.path.join(args.save_dir, f"final_{args.model}.pth")
     torch.save(
         {
-            "epoch": args.epochs,
+            "epoch": best_epoch or ran_epochs,
+            "ran_epochs": ran_epochs,
             "model_type": args.model,
             "model_state_dict": model.state_dict(),
             "val_acc": val_acc,
@@ -678,7 +709,7 @@ def main():
         model=model,
         best_val_acc=best_val_acc,
         total_train_time=total_train_time,
-        epochs=args.epochs,
+        epochs=ran_epochs,
         val_preds=best_preds if best_preds is not None else val_preds,
         val_labels=best_labels if best_labels is not None else val_labels,
     )
