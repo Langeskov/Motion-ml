@@ -69,6 +69,15 @@ def parse_args():
                         help="session 模式下如何选留出会话: "
                              "count=按会话数(默认, 新增小会话也能进训练集); "
                              "size=按窗口数(旧行为, 小会话会被全吸进验证集)")
+    parser.add_argument("--val_sessions", type=str, default="",
+                        help="显式指定留出会话 (逗号分隔)。用于固定划分做可比实验; "
+                             "留空则按 split_strategy 自动划分")
+    parser.add_argument("--target_hz", type=float, default=50.0,
+                        help="重采样目标频率 Hz (默认 50)。各会话原生采样率差异极大 "
+                             "(实测 4.9~250 Hz), 不重采样则「150 帧」的物理时长不一致。"
+                             "填 0 关闭重采样")
+    parser.add_argument("--min_source_hz", type=float, default=20.0,
+                        help="原生采样率低于此值的会话直接跳过 (避免上采样凭空插值)")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--select_metric", type=str, default="acc",
                         choices=["acc", "macro_f1"],
@@ -422,13 +431,27 @@ def main():
             window_size=args.window_size,
             stride=args.stride,
             drop_features=drop_features,
+            target_hz=args.target_hz,
+            min_source_hz=args.min_source_hz,
         )
-        train_parts, val_parts, val_session_ids = session_level_split(
-            per_session,
-            val_ratio=1.0 - args.train_ratio,
-            seed=42,
-            strategy=args.split_strategy,
-        )
+
+        if args.val_sessions:
+            want = {s.strip() for s in args.val_sessions.split(",") if s.strip()}
+            known = {p["session_id"] for p in per_session}
+            missing = want - known
+            if missing:
+                raise SystemExit(f"[Train] --val_sessions 中的会话不存在: {sorted(missing)}")
+            val_parts = [p for p in per_session if p["session_id"] in want]
+            train_parts = [p for p in per_session if p["session_id"] not in want]
+            val_session_ids = [p["session_id"] for p in val_parts]
+            print(f"[Train] 使用显式指定的留出会话 ({len(val_parts)} 个)")
+        else:
+            train_parts, val_parts, val_session_ids = session_level_split(
+                per_session,
+                val_ratio=1.0 - args.train_ratio,
+                seed=42,
+                strategy=args.split_strategy,
+            )
         trX_raw, trY = concat_windows(train_parts)
         vaX_raw, vaY = concat_windows(val_parts)
 
@@ -453,6 +476,8 @@ def main():
             window_size=args.window_size,
             stride=args.stride,
             drop_features=drop_features,
+            target_hz=args.target_hz,
+            min_source_hz=args.min_source_hz,
         )
         actual_input_size = dataset.X.shape[2]
 

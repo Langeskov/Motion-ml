@@ -75,6 +75,10 @@ def parse_args():
                         choices=["session", "window"],
                         help="session=留出整段会话(可信评测, 默认); "
                              "window=窗口级随机划分(存在时间泄漏)")
+    parser.add_argument("--target_hz", type=float, default=50.0,
+                        help="重采样目标频率 Hz (默认 50); 填 0 关闭")
+    parser.add_argument("--min_source_hz", type=float, default=20.0,
+                        help="原生采样率低于此值的会话直接跳过")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--select_metric", type=str, default="acc",
                         choices=["acc", "macro_f1"],
@@ -279,6 +283,8 @@ def main():
             data_dir=args.data_dir,
             window_size=args.window_size,
             stride=args.stride,
+            target_hz=args.target_hz,
+            min_source_hz=args.min_source_hz,
         )
         train_parts, val_parts, val_session_ids = session_level_split(
             per_session, val_ratio=1.0 - args.train_ratio, seed=42,

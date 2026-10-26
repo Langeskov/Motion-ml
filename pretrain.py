@@ -65,6 +65,10 @@ def parse_args():
                         choices=["session", "all"],
                         help="session=只用训练会话做预训练(避免看到验证会话); "
                              "all=使用全部会话")
+    parser.add_argument("--target_hz", type=float, default=50.0,
+                        help="重采样目标频率 Hz (默认 50); 填 0 关闭")
+    parser.add_argument("--min_source_hz", type=float, default=20.0,
+                        help="原生采样率低于此值的会话直接跳过")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--log_dir", type=str, default="runs/pretrain")
     parser.add_argument("--no_tensorboard", action="store_true")
@@ -248,6 +252,8 @@ def main():
             data_dir=args.data_dir,
             window_size=args.window_size,
             stride=args.stride,
+            target_hz=args.target_hz,
+            min_source_hz=args.min_source_hz,
         )
         tr_parts, va_parts, val_session_ids = session_level_split(
             per, val_ratio=1.0 - args.train_ratio, seed=42

@@ -74,6 +74,151 @@ def _sliding_windows(
     return np.stack(X).astype(np.float32), np.array(Y, dtype=np.int64)
 
 
+def _sliding_windows_by_segment(
+    features: np.ndarray,
+    labels: np.ndarray,
+    segments,
+    window_size: int,
+    stride: int,
+    fixed_label: int = -1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    只在同一个连续段内切窗口, 避免一个窗口跨越录音中断 (实测最长停顿 525 秒)。
+
+    segments 为每行的段号; 为 None 时退化为普通滑动窗口。
+    """
+    if segments is None or len(segments) != len(features):
+        return _sliding_windows(features, labels, window_size, stride, fixed_label)
+
+    change = np.where(np.diff(segments) != 0)[0] + 1
+    bounds = np.concatenate([[0], change, [len(segments)]])
+
+    Xs, Ys = [], []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b - a < window_size:
+            continue
+        xs, ys = _sliding_windows(
+            features[a:b], labels[a:b], window_size, stride, fixed_label
+        )
+        if len(xs):
+            Xs.append(xs)
+            Ys.append(ys)
+
+    if not Xs:
+        return (np.empty((0, window_size, features.shape[1]), dtype=np.float32),
+                np.empty(0, dtype=np.int64))
+    return np.concatenate(Xs, axis=0), np.concatenate(Ys, axis=0)
+
+
+# ── 重采样 ──────────────────────────────────────────────────
+#
+# 为什么必须重采样:
+#   各会话的 IMU 有效采样率差异极大 (实测 4.9 ~ 250 Hz)。窗口长度以"帧数"定义,
+#   所以同样 150 帧, 在 250 Hz 会话上是 0.6 秒, 在 50 Hz 会话上是 3 秒。
+#   滚动统计 (10 帧窗口) 的物理含义也随之改变 —— 模型被迫在两种时间尺度间折中。
+#
+#   统一重采样到固定频率后, "150 帧" 才有确定含义, 跨会话特征才可比。
+
+
+def estimate_rate_hz(timestamps, max_gap_ms: float = 1000.0) -> float:
+    """
+    估计采集的**瞬时采样率** (Hz)。
+
+    用活跃间隔的**中位数**而不是均值: 采集常出现密集段 + 次秒级停顿,
+    均值会被停顿拉低 (实测同一会话均值 13.7 Hz, 中位数 90.9 Hz),
+    而决定"能否降采样/是否会上采样"的是采样点本身的间隔。
+
+    Args:
+        timestamps: 时间戳序列 (毫秒)
+        max_gap_ms: 超过此间隔视为停顿, 不计入
+
+    Returns:
+        采样率 (Hz); 无法估计时返回 0.0
+    """
+    t = np.sort(np.asarray(timestamps, dtype=np.float64))
+    if len(t) < 2:
+        return 0.0
+    d = np.diff(t)
+    active = d[(d > 0) & (d < max_gap_ms)]
+    if len(active) == 0:
+        return 0.0
+    return float(1000.0 / np.median(active))
+
+
+def assign_segments(timestamps, max_gap_ms: float = 1000.0) -> np.ndarray:
+    """
+    按时间间隙把样本切成连续段, 返回每行的段号 (从 0 开始)。
+
+    两个作用:
+      1. 重采样只在段内进行, 不会把停顿"补"成插值数据
+      2. 滑动窗口只在段内切, 避免一个窗口跨越大段录音中断
+    """
+    t = np.asarray(timestamps, dtype=np.float64)
+    seg = np.zeros(len(t), dtype=np.int32)
+    if len(t) > 1:
+        seg[1:] = np.cumsum(np.diff(t) > max_gap_ms)
+    return seg
+
+
+def _resample_uniform(sub: pd.DataFrame, target_hz: float, time_col: str) -> pd.DataFrame:
+    """把一段连续数据重采样到固定频率 (数值列插值, 类别/布尔列最近邻)。"""
+    t = sub[time_col].to_numpy(dtype=np.float64)
+    dur_s = (t[-1] - t[0]) / 1000.0
+    n = int(np.floor(dur_s * target_hz)) + 1
+    if n < 2:
+        return sub
+
+    grid = t[0] + np.arange(n) * (1000.0 / target_hz)
+    nn_idx = np.clip(np.searchsorted(t, grid, side="right") - 1, 0, len(t) - 1)
+
+    out = {time_col: grid}
+    for col in sub.columns:
+        if col == time_col:
+            continue
+        s = sub[col]
+        vals = s.to_numpy()
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            out[col] = np.interp(grid, t, vals.astype(np.float64))
+        else:
+            out[col] = vals[nn_idx]
+    return pd.DataFrame(out)
+
+
+def resample_frame(
+    df: pd.DataFrame,
+    target_hz: float,
+    time_col: str = "timestamp",
+    max_gap_ms: float = 200.0,
+) -> pd.DataFrame:
+    """
+    把对齐后的数据重采样到固定频率, **按连续段分别处理**。
+
+    关键: 先在大于 max_gap_ms 的间隙处把数据切开, 每段独立重采样, 再拼回。
+    因此停顿间隙会被完整保留, 不会被线性插值"补"成虚构数据
+    (早期版本对整段插值, 一个 2755 秒的会话被撑成 137,747 行, 几乎全是编的)。
+
+    数值列线性插值; 布尔/类别列 (label / fixStatus / gps_valid 等) 取最近邻。
+    """
+    if target_hz is None or target_hz <= 0 or len(df) < 2:
+        return df
+
+    t = df[time_col].to_numpy(dtype=np.float64)
+    breaks = np.where(np.diff(t) > max_gap_ms)[0] + 1
+    bounds = np.concatenate([[0], breaks, [len(df)]])
+
+    parts = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b - a < 2:            # 段内样本太少, 不足以插值
+            if b > a:
+                parts.append(df.iloc[a:b])
+            continue
+        parts.append(_resample_uniform(df.iloc[a:b], target_hz, time_col))
+
+    if not parts:
+        return df
+    return pd.concat(parts, ignore_index=True)
+
+
 class MotionWindowDataset(Dataset):
     """
     基于滑动窗口的运动数据集。
@@ -112,6 +257,8 @@ class MotionWindowDataset(Dataset):
         max_gap_ms: float = 2000.0,
         builder: Optional[FeatureBuilder] = None,
         drop_features: Optional[list[str]] = None,
+        target_hz: float = 50.0,
+        min_source_hz: float = 20.0,
         verbose: bool = True,
     ):
         if isinstance(sessions, SessionDataset):
@@ -124,6 +271,8 @@ class MotionWindowDataset(Dataset):
 
         self.feature_map = builder.feature_map  # 暴露给下游
         self.drop_features = list(drop_features) if drop_features else []
+        self.target_hz = target_hz
+        self.min_source_hz = min_source_hz
 
         aligner = TimeAligner(max_gap_ms=max_gap_ms)
         extractor = FeatureExtractor(rolling_window=rolling_window)
@@ -143,6 +292,32 @@ class MotionWindowDataset(Dataset):
 
             if verbose:
                 print(f"  [{session.session_id}] {align_stats}")
+
+            # Step A2: 重采样到固定频率 — 让 "窗口=150 帧" 有确定的物理时长
+            src_hz = estimate_rate_hz(session.imu["timestamp"])
+            # 200ms: 超过 4 个 50Hz 周期即视为真实断点, 不插值、不跨段切窗。
+            # 实测 1000ms 会把一个 15875 行的会话撑到 57961 行 (3.7x, 大半是编的),
+            # 200ms 则与原生采样率换算一致。
+            seg_gap_ms = 200.0
+            if self.target_hz and self.target_hz > 0:
+                if src_hz > 0 and src_hz < self.min_source_hz:
+                    if verbose:
+                        print(f"  [{session.session_id}] 跳过: 原生采样率仅 "
+                              f"{src_hz:.1f} Hz (< {self.min_source_hz} Hz), "
+                              f"上采样会凭空插值")
+                    continue
+                n_before = len(aligned)
+                aligned = resample_frame(
+                    aligned, self.target_hz, max_gap_ms=seg_gap_ms
+                )
+                if verbose and src_hz > 0:
+                    print(f"  [{session.session_id}] 重采样: {src_hz:.1f} Hz → "
+                          f"{self.target_hz:.0f} Hz ({n_before} → {len(aligned)} 行)")
+
+            # 标记连续段: 重采样只在段内进行, 切窗也只在段内进行
+            aligned["_segment"] = assign_segments(
+                aligned["timestamp"].values, seg_gap_ms
+            )
 
             # Step B: FeatureBuilder — 按 FeatureSpec 做单位转换+NaN处理
             base_features, fmap, build_stats = builder.build(aligned)
@@ -177,6 +352,11 @@ class MotionWindowDataset(Dataset):
             valid_mask = ~np.isnan(labels)
             feat = feat[valid_mask]
             labels = labels[valid_mask].astype(np.int64)
+            seg_arr = aligned["_segment"].values
+            if len(seg_arr) != len(valid_mask):
+                seg_arr = None
+            else:
+                seg_arr = seg_arr[valid_mask]
 
             # Step D: 逐 Session 做滑动窗口 (防止跨 Session 数据泄漏)
             session_label = LABEL_MAP.get(session.label.upper().strip(), -1)
@@ -185,8 +365,9 @@ class MotionWindowDataset(Dataset):
                     print(f"  [{session.session_id}] 跳过: 未知标签 '{session.label}'")
                 continue
 
-            session_X, session_Y = _sliding_windows(
-                feat, labels, window_size, stride, fixed_label=session_label
+            session_X, session_Y = _sliding_windows_by_segment(
+                feat, labels, seg_arr, window_size, stride,
+                fixed_label=session_label,
             )
             n_windows = len(session_X)
             if n_windows == 0:
@@ -260,6 +441,8 @@ def build_session_dataset(
     builder: Optional[FeatureBuilder] = None,
     repair_timestamps: bool = True,
     drop_features: Optional[list[str]] = None,
+    target_hz: float = 50.0,
+    min_source_hz: float = 20.0,
 ) -> tuple[MotionWindowDataset, StandardScaler]:
     """
     一站式构建数据集。
@@ -293,6 +476,8 @@ def build_session_dataset(
         max_gap_ms=max_gap_ms,
         builder=builder,
         drop_features=drop_features,
+        target_hz=target_hz,
+        min_source_hz=min_source_hz,
     )
 
     return dataset, dataset.scaler
@@ -319,11 +504,17 @@ def build_per_session_windows(
     builder: Optional[FeatureBuilder] = None,
     repair_timestamps: bool = True,
     drop_features: Optional[list[str]] = None,
+    target_hz: float = 50.0,
+    min_source_hz: float = 20.0,
 ) -> list[dict]:
     """
     逐 Session 构建窗口 (未标准化), 返回会话级窗口列表。
 
     用于 Session 级训练/验证划分: 标准化参数只能在训练会话上拟合。
+
+    Args:
+        target_hz:     重采样目标频率 (Hz); <=0 表示不重采样
+        min_source_hz: 原生采样率低于此值的会话直接跳过 (避免上采样凭空插值)
 
     Returns:
         [{"session_id": str, "label": str, "label_id": int,
@@ -333,12 +524,13 @@ def build_per_session_windows(
                         repair_timestamps=repair_timestamps)
     out = []
 
-    # 先探出特征维度, 再构造恒等 scaler (不改变数值, 只绕过未拟合检查)
+    # 先探出特征维度, 再构造恒等 scaler (不改变数值, 只绕过未拟合检查)。
+    # 探测时不重采样、不跳过, 保证任何会话都能给出维度。
     probe_session = ds.sessions[0]
     probe = MotionWindowDataset(
         sessions=[probe_session], window_size=window_size, stride=stride,
         rolling_window=rolling_window, max_gap_ms=max_gap_ms, builder=builder,
-        drop_features=drop_features,
+        drop_features=drop_features, target_hz=0,
         verbose=False,
     )
     dim = probe.feature_dim
@@ -353,13 +545,20 @@ def build_per_session_windows(
         if label_id < 0:
             print(f"  [跳过] {s.session_id}: 未知标签 '{s.label}'")
             continue
-        d = MotionWindowDataset(
-            sessions=[s], window_size=window_size, stride=stride,
-            scaler=ident, fit_scaler=False,
-            rolling_window=rolling_window, max_gap_ms=max_gap_ms, builder=builder,
-            drop_features=drop_features,
-            verbose=False,
-        )
+        try:
+            d = MotionWindowDataset(
+                sessions=[s], window_size=window_size, stride=stride,
+                scaler=ident, fit_scaler=False,
+                rolling_window=rolling_window, max_gap_ms=max_gap_ms, builder=builder,
+                drop_features=drop_features,
+                target_hz=target_hz, min_source_hz=min_source_hz,
+                verbose=False,
+            )
+        except ValueError:
+            # 例如原生采样率过低被跳过 → 没有可用窗口
+            print(f"  [跳过] {s.session_id}: 无可用的窗口 "
+                  f"(采样率过低或帧数不足)")
+            continue
         if len(d.X) == 0:
             print(f"  [跳过] {s.session_id}: 帧数不足 {window_size}")
             continue
