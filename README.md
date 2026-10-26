@@ -4,12 +4,15 @@
 
 ## 支持的模型
 
-| 模型 | 参数量 | 说明 |
-|------|--------|------|
-| `lstm` | ~210K | 双层 LSTM |
-| `cnn_lstm` | ~297K | CNN 提取局部震动 + LSTM 时序建模 |
-| `cnn_transformer` | ~409K | CNN + Transformer Encoder + Attention Pooling |
-| `motion_encoder` | ~419K | 自监督预训练 Encoder，支持 pretrain → finetune |
+| 模型 | 参数量 (24 维输入) | 说明 | OOF macro F1 |
+|------|--------------------:|------|-------------:|
+| **`motion_encoder`** | 408,710 | Transformer Encoder + AttentionPooling | **0.747** ← 推荐 |
+| `cnn_transformer` | 454,854 | CNN + Transformer Encoder + AttentionPooling | 0.713 |
+| `cnn_lstm` | 297,669 | CNN 提取局部震动 + LSTM 时序建模 | 0.695 |
+| `lstm` | 211,589 | 双层 LSTM | 0.686 |
+
+> OOF macro F1 为 3 折 × 3 种子的均值（24 维特征，去 yaw/pitch/roll），
+> 完整对比见「模型对比」一节。
 
 ## 运动类别
 
@@ -45,7 +48,7 @@ SessionDataset          扫描目录，配对 *_imu.csv ↔ *_gnss.csv
   → TimeAligner         GNSS speed 对齐到 IMU 时间轴 (≤2s)
   → Resample            重采样到固定 50 Hz (按连续段分别处理, 间隙保留)
   → FeatureBuilder      m/s→km/h, NaN→0, 输出 [N, 10]
-  → FeatureExtractor    10维 → 21维 (模长、滚动统计、震动指标)
+  → FeatureExtractor    10维 → 27维 (模长、滚动统计、震动指标、频带能量/谱质心/主频)
   → StandardScaler      标准化
   → Sliding Windows     窗口=150帧(=3秒), 步长=50, 段内切分
   → MotionWindowDataset PyTorch Dataset
@@ -81,7 +84,7 @@ python train.py --model cnn_transformer --epochs 60 \
     --split_mode session --select_metric macro_f1
 
 # 评估（自动只评估留出会话）
-python evaluate.py --checkpoint checkpoints/best_cnn_transformer.pth
+python evaluate.py --checkpoint checkpoints/best_motion_encoder.pth
 
 # 评估全量数据（含训练集，指标虚高，仅用于冒烟）
 python evaluate.py --checkpoint ... --all
@@ -97,8 +100,9 @@ python evaluate.py --checkpoint ... --all
 
 ## 基线结果
 
-> 以下各节按时间顺序记录演进过程。**当前基准以「Session 级 K 折交叉验证」一节为准**
-> （OOF macro F1 0.662）。早期表格保留用于对照，但它们早于重采样和早停，不可直接与最新数字比较。
+> 以下各节按时间顺序记录演进过程。**当前基准：`motion_encoder` + 24 维特征（含频域），
+> OOF macro F1 0.747**（见「模型对比」一节）。早期表格保留用于对照，但它们早于重采样、
+> 早停和频域特征，不可直接与最新数字比较。
 
 ### 阶段一：早期结果（23 会话，未重采样，单次留出）
 
@@ -166,7 +170,8 @@ python evaluate.py --checkpoint ... --all
 python cv.py --folds 3 --target_hz 50 --drop_features yaw,pitch,roll
 ```
 
-3 折袋外（out-of-fold）结果，23,178 个样本：
+3 折袋外（out-of-fold）结果，23,178 个样本
+（**18 维特征、尚无频域特征**，作为后续改进的起点）：
 
 | 类别 | F1 | support（窗口数） |
 |------|-----|------------------:|
@@ -195,13 +200,68 @@ python cv.py --folds 3 --target_hz 50 --drop_features yaw,pitch,roll
 - 开早停后 3 折总共只花 **136 秒**（每折最优 epoch 分别为 14/14/1），
   所以现在做多种子、多模型的对比变得很便宜。
 
+### 频域特征的收益（配对实验）
+
+给 `FeatureExtractor` 新增 6 维频域特征（4 个频带能量占比 + 谱质心 + 主频），
+特征从 18 维升到 24 维。由于 `cv.py` 的折分只依赖会话与种子，**两种配置的折分完全相同**，
+所以这是干净的配对对比（3 个种子 × 3 折，每个种子下基线与新特征用同一折分）：
+
+| seed | 基线 18 维 | +频域 24 维 | 增量 |
+|-----:|-----------:|------------:|-----:|
+| 1 | 0.5759 | 0.6791 | +0.103 |
+| 2 | 0.5457 | 0.7377 | +0.192 |
+| 3 | 0.6314 | 0.7207 | +0.089 |
+| **均值** | **0.5843 ± 0.0355** | **0.7125 ± 0.0246** | **+0.128** |
+
+Accuracy：0.7614 → 0.8238（+0.062）。三次增量全部为正，且都远超运行间波动。
+
+每类 F1（三种子均值）：
+
+| 类别 | 基线 | +频域 | 增量 |
+|------|-----:|------:|-----:|
+| STATIONARY | 0.392 | 0.726 | **+0.334** |
+| WALKING | 0.386 | 0.473 | +0.088 |
+| CYCLING | 0.554 | 0.666 | **+0.112** |
+| CAR | 0.891 | 0.909 | +0.019 |
+| TRAIN | 0.700 | 0.789 | +0.088 |
+
+五类全部提升。STATIONARY 与 CYCLING 涨得最多，正好对应诊断中指出的
+"电动车振动集中在 2~5 Hz、汽车偏 10~25 Hz" 这一信号。
+
+### 模型对比（24 维特征，3 折 × 3 种子）
+
+| 模型 | Macro F1 | Accuracy | 单次 CV 耗时 |
+|------|---------:|---------:|-------------:|
+| **motion_encoder** | **0.7469 ± 0.0109** | 0.8365 ± 0.0154 | 126 s |
+| cnn_transformer | 0.7125 ± 0.0246 | 0.8238 ± 0.0262 | 132 s |
+| cnn_lstm | 0.6947 ± 0.0220 | 0.8189 ± 0.0196 | 79 s |
+| lstm | 0.6855 ± 0.0145 | 0.8160 ± 0.0104 | 91 s |
+
+每类 F1（三种子均值）：
+
+| 类别 | motion_encoder | cnn_transformer | cnn_lstm | lstm |
+|------|---------------:|----------------:|---------:|-----:|
+| STATIONARY | 0.734 | 0.726 | 0.734 | 0.648 |
+| WALKING | **0.590** | 0.473 | 0.404 | 0.419 |
+| CYCLING | **0.693** | 0.666 | 0.651 | 0.686 |
+| CAR | 0.916 | 0.909 | 0.911 | 0.912 |
+| TRAIN | **0.803** | 0.789 | 0.774 | 0.763 |
+
+结论：
+
+- **`motion_encoder`（MotionClassifier 架构）全面领先**，且三种子逐一对比都赢
+  （+0.054 / +0.010 / +0.039，均值 +0.034）。
+- 它的运行间波动也是最小的（±0.011 vs cnn_transformer 的 ±0.025）。
+- 它在 WALKING 上优势最明显（0.590 vs 0.473）—— 随机游走式的姿态变化更依赖全局注意力。
+- **推荐默认模型：`motion_encoder`**。
+
 ### 当前产物与复现
 
-仓库内的 `checkpoints/best_cnn_transformer.pth` 由以下命令生成（确定性模式，第 5 轮达峰、
-第 15 轮早停，val macro F1 0.717 / acc 79.7%）：
+仓库内的 `checkpoints/best_motion_encoder.pth` 由以下命令生成（确定性模式，第 11 轮达峰、
+第 21 轮早停，val macro F1 0.725 / acc 77.6%）：
 
 ```bash
-python train.py --model cnn_transformer --epochs 60 --batch_size 64 \
+python train.py --model motion_encoder --epochs 60 --batch_size 64 \
     --split_mode session --select_metric macro_f1 --target_hz 50 \
     --drop_features yaw,pitch,roll --seed 42 --deterministic \
     --early_stop_patience 10 --val_sessions "STATIONARY_20261022_100043,\
@@ -317,11 +377,13 @@ pip install -r requirements.txt
 ### 有监督训练
 
 ```bash
-# 推荐配置: session 级划分 + macro-F1 选模型 + 剔除绝对姿态角
-python train.py --model cnn_transformer --epochs 60 \
-    --split_mode session --select_metric macro_f1 \
+# 推荐配置: motion_encoder + 24 维特征 + session 划分 + macro-F1 选模型
+python train.py --model motion_encoder --epochs 60 \
+    --split_mode session --select_metric macro_f1 --target_hz 50 \
     --drop_features yaw,pitch,roll
 
+# 其余模型 (同口径对比)
+python train.py --model cnn_transformer --epochs 60 --split_mode session --select_metric macro_f1
 python train.py --model cnn_lstm --epochs 60 --split_mode session --select_metric macro_f1
 python train.py --model lstm --epochs 60 --split_mode session --select_metric macro_f1
 ```
@@ -347,8 +409,8 @@ python cv.py --folds 3 --target_hz 50 --drop_features yaw,pitch,roll
 评估单个 checkpoint：
 
 ```bash
-python evaluate.py --checkpoint checkpoints/best_cnn_transformer.pth
-python export.py --checkpoint checkpoints/best_cnn_transformer.pth --onnx
+python evaluate.py --checkpoint checkpoints/best_motion_encoder.pth
+python export.py --checkpoint checkpoints/best_motion_encoder.pth --onnx
 ```
 
 ### TensorBoard
@@ -384,11 +446,18 @@ motion-ml/
 └── requirements.txt
 ```
 
-## 传感器特征 (21维)
+## 传感器特征 (27 维)
 
-**基础 (10维):** gps_speed(km/h), acc_x/y/z, gyro_x/y/z, roll, pitch, yaw
+**基础 (10 维):** gps_speed(km/h), acc_x/y/z, gyro_x/y/z, roll, pitch, yaw
 
-**派生 (11维):** acc/gyro_magnitude, speed_delta, acc/gyro/roll 滚动均值+标准差, pitch_rolling_mean, vibration_score
+**时域派生 (11 维):** acc/gyro_magnitude, speed_delta,
+acc/gyro/roll 滚动均值+标准差, pitch_rolling_mean, vibration_score
+
+**频域派生 (6 维):** acc_bp_0.5_2 / acc_bp_2_5 / acc_bp_5_10 / acc_bp_10_25（各频带能量占比）、
+acc_centroid（谱质心）、acc_dom_freq（主频）
+
+> 默认训练用 `--drop_features yaw,pitch,roll` 剔除绝对姿态角，实际输入 **24 维**。
+> 姿态角只反映手机朝向，跨会话不泛化（实测两个 STATIONARY 会话的 yaw 差 2.84σ）。
 
 ## License
 

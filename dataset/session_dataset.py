@@ -275,7 +275,6 @@ class MotionWindowDataset(Dataset):
         self.min_source_hz = min_source_hz
 
         aligner = TimeAligner(max_gap_ms=max_gap_ms)
-        extractor = FeatureExtractor(rolling_window=rolling_window)
 
         # ── 1. 逐 Session: 对齐 → 特征工程 → 标准化 → 滑动窗口 ──
         all_window_X = []
@@ -338,6 +337,12 @@ class MotionWindowDataset(Dataset):
             clean_df["label"] = clean_df["label"].str.upper().str.strip()
 
             # Step C: FeatureExtractor — 基础特征 → 派生特征
+            # 频域特征需要采样率: 重采样后就是 target_hz, 否则是该会话的原生采样率
+            if self.target_hz and self.target_hz > 0:
+                eff_hz = float(self.target_hz)
+            else:
+                eff_hz = src_hz if src_hz > 0 else 50.0
+            extractor = FeatureExtractor(rolling_window=rolling_window, fs=eff_hz)
             clean_df = extractor.transform(clean_df)
 
             # 提取特征列 (可剔除与任务无关/依赖设备的特征, 如绝对姿态角)
