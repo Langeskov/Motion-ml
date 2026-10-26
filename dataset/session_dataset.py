@@ -377,23 +377,74 @@ def build_per_session_windows(
     return out
 
 
+def _pick_val_by_count(group, target, val_ratio, seed):
+    """
+    每类留出 round(n * val_ratio) 个会话 (至少 1, 且至少留 1 个给训练),
+    在同样数量的候选组合中, 选窗口总数最接近 target 的那组。
+
+    按会话数而非窗口数决定留出规模, 这样新增的小会话不会被全部吸进验证集;
+    再按窗口数挑选具体哪些会话, 避免验证集被单个超大会话撑爆。
+    """
+    import itertools
+
+    n = len(group)
+    n_val = max(1, int(round(n * val_ratio)))
+    n_val = min(n_val, n - 1)
+
+    # 稳定排序, 保证组合枚举与并列取舍是确定性的
+    ordered = sorted(group, key=lambda p: p["session_id"])
+
+    best, best_key = None, None
+    for combo in itertools.combinations(range(n), n_val):
+        win = sum(ordered[i]["X"].shape[0] for i in combo)
+        key = (abs(win - target), tuple(ordered[i]["session_id"] for i in combo))
+        if best_key is None or key < best_key:
+            best_key, best = key, [ordered[i] for i in combo]
+    return best
+
+
+def _pick_val_by_size(group, target, seed):
+    """旧策略: 按窗口数从小到大累加, 取最接近目标的前缀。"""
+    rng = np.random.RandomState(seed)
+    jitter = rng.rand(len(group))
+    order = np.lexsort((jitter, [p["X"].shape[0] for p in group]))
+    ordered = [group[i] for i in order]
+
+    best_n, best_gap = 1, None
+    acc = 0
+    for n, p in enumerate(ordered[:-1], start=1):   # 至少留 1 个会话给训练
+        acc += p["X"].shape[0]
+        gap = abs(acc - target)
+        if best_gap is None or gap < best_gap:
+            best_gap, best_n = gap, n
+    return ordered[:best_n]
+
+
 def session_level_split(
     per_session: list[dict],
     val_ratio: float = 0.2,
     seed: int = 42,
+    strategy: str = "count",
 ) -> tuple[list[dict], list[dict], list[str]]:
     """
     按 Session 分组划分训练/验证集, 每类至少留出 1 个会话。
 
-    策略: 每类内按窗口数 **从小到大** 依次放入验证集, 直到该类的验证窗口
-    占比达到 val_ratio。这样大会话(通常信息量更丰富)优先留给训练集,
-    同时验证集比例接近目标。
+    strategy:
+      "count" (默认) — 每类按 **会话数** 留出 round(n * val_ratio) 个 (至少 1)。
+                       在同样数量的候选中, 选窗口总数最接近目标的那组,
+                       避免验证集全被小会话占据、也避免被超大会话撑爆。
+      "size"         — 旧行为: 按窗口数从小到大累加, 取最接近目标的前缀。
+                       缺点: 若新增的会话都比较小, 它们会**全部**被吸进验证集,
+                       训练集一个新会话都拿不到 (实测 6 个新会话全部落入 val)。
+
     该类只有 1 个会话时无法留出, 全部进训练集。
 
     Returns:
         (train_parts, val_parts, val_session_ids)
     """
-    rng = np.random.RandomState(seed)
+    if strategy not in ("count", "size"):
+        raise ValueError(f"strategy 必须是 'count' 或 'size', 收到 {strategy!r}")
+
     by_label: dict[int, list[dict]] = {}
     for p in per_session:
         by_label.setdefault(p["label_id"], []).append(p)
@@ -407,26 +458,14 @@ def session_level_split(
             print(f"  [警告] 类别 {group[0]['label']} 只有 1 个会话, 无法留出验证集")
             continue
 
-        # 从小到大; 同尺寸时用 seed 打散, 保证可复现且不总选同一个
-        jitter = rng.rand(len(group))
-        order = np.lexsort((jitter, [p["X"].shape[0] for p in group]))
-        group = [group[i] for i in order]
-
         total_win = sum(p["X"].shape[0] for p in group)
         target = total_win * val_ratio
 
-        # 在所有"由小到大累加"的前缀中, 选窗口数最接近目标的一个。
-        # 不能简单地"加到超过目标就停": 若下一个会话很大, 会严重过冲
-        # (实测 CAR 会从 19% 直接跳到 46%)。
-        best_n, best_gap = 1, None
-        acc = 0
-        for n, p in enumerate(group[:-1], start=1):   # 至少留 1 个会话给训练
-            acc += p["X"].shape[0]
-            gap = abs(acc - target)
-            if best_gap is None or gap < best_gap:
-                best_gap, best_n = gap, n
+        if strategy == "count":
+            held = _pick_val_by_count(group, target, val_ratio, seed)
+        else:
+            held = _pick_val_by_size(group, target, seed)
 
-        held = group[:best_n]
         held_ids = {p["session_id"] for p in held}
         val_parts.extend(held)
         train_parts.extend(p for p in group if p["session_id"] not in held_ids)

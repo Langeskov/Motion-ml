@@ -64,6 +64,11 @@ def parse_args():
                         choices=["session", "window"],
                         help="session=留出整段会话(可信评测, 默认); "
                              "window=窗口级随机划分(存在时间泄漏, 仅用于冒烟测试)")
+    parser.add_argument("--split_strategy", type=str, default="count",
+                        choices=["count", "size"],
+                        help="session 模式下如何选留出会话: "
+                             "count=按会话数(默认, 新增小会话也能进训练集); "
+                             "size=按窗口数(旧行为, 小会话会被全吸进验证集)")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--select_metric", type=str, default="acc",
                         choices=["acc", "macro_f1"],
@@ -422,6 +427,7 @@ def main():
             per_session,
             val_ratio=1.0 - args.train_ratio,
             seed=42,
+            strategy=args.split_strategy,
         )
         trX_raw, trY = concat_windows(train_parts)
         vaX_raw, vaY = concat_windows(val_parts)
