@@ -511,6 +511,7 @@ def build_per_session_windows(
     drop_features: Optional[list[str]] = None,
     target_hz: float = 50.0,
     min_source_hz: float = 20.0,
+    exclude_sessions: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     逐 Session 构建窗口 (未标准化), 返回会话级窗口列表。
@@ -546,6 +547,9 @@ def build_per_session_windows(
     ident.n_features_in_ = dim
 
     for s in ds.sessions:
+        if exclude_sessions and s.session_id in set(exclude_sessions):
+            print(f"  [排除] {s.session_id} (标签可疑/数据异常)")
+            continue
         label_id = LABEL_MAP.get(s.label.upper().strip(), -1)
         if label_id < 0:
             print(f"  [跳过] {s.session_id}: 未知标签 '{s.label}'")

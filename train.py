@@ -56,7 +56,9 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--window_size", type=int, default=150)
     parser.add_argument("--stride", type=int, default=50)
-    parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--hidden_size", type=int, default=64,
+                        help="隐藏层维度。默认 64: 在 18k 窗口 / 5 类的数据规模下 "
+                             "128 会过拟合 (实测 macro F1 0.742 vs 0.761), 32 与 64 打平")
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--train_ratio", type=float, default=0.8)
@@ -78,6 +80,8 @@ def parse_args():
                              "填 0 关闭重采样")
     parser.add_argument("--min_source_hz", type=float, default=20.0,
                         help="原生采样率低于此值的会话直接跳过 (避免上采样凭空插值)")
+    parser.add_argument("--exclude_sessions", type=str, default="",
+                        help="逗号分隔的会话 id, 直接排除 (用于剔除标签可疑/数据异常的会话)")
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--select_metric", type=str, default="acc",
                         choices=["acc", "macro_f1"],
@@ -101,6 +105,17 @@ def parse_args():
     parser.add_argument("--early_stop_patience", type=int, default=10,
                         help="早停: select_metric 连续 N 轮没有提升就停止 (0=关闭)。"
                              "实测最优 epoch 常落在第 2~31 轮, 开早停可省 50%%~95%% 训练时间")
+    parser.add_argument("--min_epochs", type=int, default=15,
+                        help="至少训练这么多轮才允许早停 (0=不限)。"
+                             "防止 macro F1 在第 1~3 轮因偶然峰值把一个几乎没训练的模型冻结下来")
+    parser.add_argument("--lr_schedule", type=str, default="cosine",
+                        choices=["none", "cosine"],
+                        help="学习率调度: cosine=warmup+余弦衰减(默认); none=恒定 lr")
+    parser.add_argument("--ema", action="store_true",
+                        help="训练时维护权重指数滑动平均(EMA), 用 EMA 权重做验证/保存。"
+                             "抹平 macro F1 的偶然峰值, 通常更稳更准")
+    parser.add_argument("--ema_decay", type=float, default=0.999,
+                        help="EMA 衰减系数 (默认 0.999)")
     parser.add_argument("--deterministic", action="store_true",
                         help="强制 cuDNN 确定性算法。同种子可复现, 但会慢一些。"
                              "实测同种子两次运行的 val_acc 可差 2.5pt (GPU 非确定性)")
@@ -121,6 +136,65 @@ def get_device() -> torch.device:
         dev = torch.device("cpu")
         print("[Train] Using CPU")
     return dev
+
+
+class ModelEMA:
+    """
+    权重指数滑动平均 (Exponential Moving Average)。
+
+    为什么需要: 在只有 188 个 STATIONARY 样本的验证集上, macro F1 是粗粒度跳变指标,
+    第 1~3 轮容易因"蒙对几个样本"冲到峰值, 早停随即冻结一个几乎没训练的模型
+    (实测 best epoch 长期落在 1~3)。对权重做 EMA 可以把这种偶然峰值抹平,
+    让"最优轮"更靠后也更稳定。
+
+    只对浮点参数做 EMA; buffer (如 BatchNorm 的 running stats) 直接取当前值。
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    @torch.no_grad()
+    def state_dict(self) -> dict:
+        return self.shadow
+
+
+def build_scheduler(optimizer, steps_per_epoch: int, total_epochs: int, mode: str):
+    """
+    构建学习率调度器。
+
+    "cosine": 前 5% 步数线性 warmup, 之后余弦衰减到 0。
+              Transformer 家族通常需要 warmup, 否则早期大 lr 会把注意力打散。
+    "none":   恒定学习率。
+    """
+    if mode == "none":
+        return None
+    if mode != "cosine":
+        raise ValueError(f"lr_schedule 必须是 'none' 或 'cosine', 收到 {mode!r}")
+
+    import math
+
+    total_steps = max(1, steps_per_epoch * total_epochs)
+    warmup_steps = max(1, int(total_steps * 0.05))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / warmup_steps
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(t, 1.0)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def augment_batch(
@@ -165,6 +239,8 @@ def train_one_epoch(
     aug_jitter: float = 0.01,
     aug_scale: tuple[float, float] = (0.95, 1.05),
     aug_shift: int = 5,
+    scheduler=None,
+    ema=None,
 ) -> tuple[float, float]:
     """训练一个 epoch，返回 (平均loss, accuracy)。"""
     model.train()
@@ -187,6 +263,12 @@ def train_one_epoch(
         loss = criterion(logits, Y_batch)
         loss.backward()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        # EMA 必须每个 step 更新: decay=0.999 的有效记忆约 1000 步,
+        # 若按轮更新则 60 轮只推进约 6%, 权重会长期停留在初始化附近
+        if ema is not None:
+            ema.update(model)
 
         total_loss += loss.item() * X_batch.size(0)
         preds = logits.argmax(dim=1)
@@ -434,6 +516,7 @@ def main():
     print("=" * 60)
 
     drop_features = [s.strip() for s in args.drop_features.split(",") if s.strip()]
+    exclude = [s.strip() for s in args.exclude_sessions.split(",") if s.strip()]
 
     if args.split_mode == "session":
         # 可信协议: 留出整段会话, 验证集与训练集无时间重叠
@@ -444,6 +527,7 @@ def main():
             drop_features=drop_features,
             target_hz=args.target_hz,
             min_source_hz=args.min_source_hz,
+            exclude_sessions=exclude or None,
         )
 
         if args.val_sessions:
@@ -540,6 +624,18 @@ def main():
         criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=args.weight_decay)
+
+    steps_per_epoch = max(1, len(train_loader))
+    scheduler = build_scheduler(
+        optimizer, steps_per_epoch, args.epochs, args.lr_schedule
+    )
+    if args.lr_schedule != "none":
+        print(f"[Train] lr_schedule={args.lr_schedule} (warmup 5% + 余弦衰减)")
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    if ema:
+        print(f"[Train] weight EMA: decay={args.ema_decay} (用 EMA 权重做验证/保存)")
+
     if args.weight_decay > 0:
         print(f"[Train] weight_decay={args.weight_decay}")
     if args.augment:
@@ -595,10 +691,24 @@ def main():
             augment=args.augment,
             aug_jitter=args.aug_jitter,
             aug_shift=args.aug_shift,
+            scheduler=scheduler,
+            ema=ema,
         )
+
+        # 用 EMA 权重做验证 (EMA 已在每个 step 更新过); 验证后换回原始权重继续训练
+        if ema is not None:
+            raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(ema.state_dict())
+
         val_loss, val_acc, val_preds, val_labels = validate(
             model, val_loader, criterion, device
         )
+
+        # 此刻 model 里装的是"参与评估的权重" (EMA 或原始), 保存时用它
+        eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        if ema is not None:
+            model.load_state_dict(raw_state)
 
         elapsed = time.time() - t0
         total_train_time += elapsed
@@ -634,14 +744,14 @@ def main():
             best_epoch = epoch
             epochs_no_improve = 0
             best_preds, best_labels = val_preds, val_labels
-            # 记住最优权重, 训练结束后恢复 (早停时模型已不在最优点)
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # 记住最优权重 (EMA 开启时即 EMA 权重), 训练结束后恢复
+            best_state = eval_state
             save_path = os.path.join(args.save_dir, f"best_{args.model}.pth")
             torch.save(
                 {
                     "epoch": epoch,
                     "model_type": args.model,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": eval_state,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
                     "val_loss": val_loss,
@@ -659,7 +769,8 @@ def main():
         else:
             epochs_no_improve += 1
             if (args.early_stop_patience > 0
-                    and epochs_no_improve >= args.early_stop_patience):
+                    and epochs_no_improve >= args.early_stop_patience
+                    and epoch >= args.min_epochs):
                 print(f"  [早停] {args.early_stop_patience} 轮无提升, "
                       f"在 epoch {epoch} 停止 (最优 epoch={best_epoch})")
                 break

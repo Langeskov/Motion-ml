@@ -42,7 +42,7 @@ from dataset.session_dataset import (
     fit_scaler_on_windows,
 )
 from models import MODEL_TYPES, build_model_by_type
-from train import train_one_epoch, validate
+from train import ModelEMA, build_scheduler, train_one_epoch, validate
 
 INV = {v: k for k, v in LABEL_MAP.items()}
 
@@ -58,7 +58,8 @@ def parse_args():
     p.add_argument("--early_stop_patience", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--hidden_size", type=int, default=128)
+    p.add_argument("--hidden_size", type=int, default=64,
+                   help="隐藏层维度。默认 64: 128 在本数据规模下会过拟合")
     p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -69,6 +70,20 @@ def parse_args():
     p.add_argument("--drop_features", type=str, default="yaw,pitch,roll")
     p.add_argument("--select_metric", type=str, default="macro_f1",
                    choices=["acc", "macro_f1"])
+    p.add_argument("--min_epochs", type=int, default=15,
+                   help="至少训练这么多轮才允许早停 (0=不限)")
+    p.add_argument("--lr_schedule", type=str, default="cosine",
+                   choices=["none", "cosine"],
+                   help="学习率调度: cosine=warmup+余弦衰减(默认); none=恒定 lr")
+    p.add_argument("--ema", action="store_true",
+                   help="权重指数滑动平均, 用 EMA 权重做验证/保存")
+    p.add_argument("--ema_decay", type=float, default=0.999)
+    p.add_argument("--augment", action="store_true",
+                   help="训练数据增强 (幅度缩放+高斯抖动+时间平移)")
+    p.add_argument("--aug_jitter", type=float, default=0.01)
+    p.add_argument("--aug_shift", type=int, default=5)
+    p.add_argument("--exclude_sessions", type=str, default="",
+                   help="逗号分隔的会话 id, 直接排除 (用于剔除标签可疑/数据异常的会话)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="cv_result.json")
     return p.parse_args()
@@ -119,6 +134,10 @@ def train_fold(args, tr_parts, va_parts, device, fold_no, k):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=args.weight_decay)
+    scheduler = build_scheduler(
+        optimizer, max(1, len(train_loader)), args.epochs, args.lr_schedule
+    )
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
 
     best_score, best_state, best_pred, best_true = -1.0, None, None, None
     best_epoch, no_improve = 0, 0
@@ -130,16 +149,32 @@ def train_fold(args, tr_parts, va_parts, device, fold_no, k):
 
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
-        train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_one_epoch(model, train_loader, criterion, optimizer, device,
+                        scheduler=scheduler, ema=ema,
+                        augment=args.augment,
+                        aug_jitter=args.aug_jitter, aug_shift=args.aug_shift)
+
+        # 用 EMA 权重评估 (EMA 已在每个 step 更新过), 验证后换回原始权重继续训练
+        if ema is not None:
+            raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(ema.state_dict())
+
         _, _, pred, true = validate(model, val_loader, criterion, device)
+        eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        if ema is not None:
+            model.load_state_dict(raw_state)
+
         s = score_of(pred, true)
         if s > best_score:
             best_score, best_epoch, no_improve = s, epoch, 0
             best_pred, best_true = pred, true
-            best_state = {kk: vv.detach().clone() for kk, vv in model.state_dict().items()}
+            best_state = eval_state
         else:
             no_improve += 1
-            if args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
+            if (args.early_stop_patience > 0
+                    and no_improve >= args.early_stop_patience
+                    and epoch >= args.min_epochs):
                 break
     dt = time.time() - t0
 
@@ -166,6 +201,7 @@ def main():
     print(f"[CV] device={device}")
 
     drop_features = [s.strip() for s in args.drop_features.split(",") if s.strip()]
+    exclude = [s.strip() for s in args.exclude_sessions.split(",") if s.strip()]
     print("[CV] 构建逐会话窗口 ...")
     per = build_per_session_windows(
         data_dir=args.data_dir,
@@ -174,6 +210,7 @@ def main():
         drop_features=drop_features,
         target_hz=args.target_hz,
         min_source_hz=args.min_source_hz,
+        exclude_sessions=exclude or None,
     )
 
     counts = {}

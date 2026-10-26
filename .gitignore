@@ -17,6 +17,7 @@ ENV/
 
 # ========== 采集数据 (个人 GPS 轨迹, 隐私敏感) ==========
 data/raw/
+data/quarantine/
 
 # ========== 训练产物 ==========
 checkpoints/

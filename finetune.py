@@ -66,7 +66,8 @@ def parse_args():
                         help="Learning rate after unfreezing encoder")
     parser.add_argument("--window_size", type=int, default=150)
     parser.add_argument("--stride", type=int, default=50)
-    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--d_model", type=int, default=64,
+                        help="Transformer 特征维度。默认 64 (128 在本数据规模下会过拟合)")
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
