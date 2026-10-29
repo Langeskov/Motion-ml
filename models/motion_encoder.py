@@ -300,8 +300,11 @@ class MotionClassifier(nn.Module):
         self.attn_pool = AttentionPooling(d_model)
         self.classifier = ClassificationHead(d_model, num_classes, dropout)
 
-        # 缓存 attention weights
+        # 缓存 attention weights (用于可视化)
         self._cached_attn_weights: Optional[torch.Tensor] = None
+        # forward 里给 self 赋值张量属于副作用, 会让 ONNX 导出把 batch 维特化成具体值
+        # (实测输出被钉成 [1, 5])。导出前把该开关置 False。
+        self._capture_attention: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -318,7 +321,8 @@ class MotionClassifier(nn.Module):
 
         # Attention Pooling
         pooled, attn_weights = self.attn_pool(encoder_out)
-        self._cached_attn_weights = attn_weights.detach()
+        if self._capture_attention:
+            self._cached_attn_weights = attn_weights.detach()
 
         # Classification
         logits = self.classifier(pooled)

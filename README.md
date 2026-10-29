@@ -537,6 +537,7 @@ motion-ml/
 ├── evaluate.py              # 模型评估
 ├── cv.py                    # Session 级 K 折交叉验证 (推荐的可信评估)
 ├── export.py                # 导出 .pth / ONNX
+├── verify_onnx.py           # ONNX 导出验证 (数值一致性 / 动态 batch)
 ├── test_v5_pipeline.py      # 管线完整性测试
 ├── dataset/
 │   ├── session_loader.py    # Session 发现与加载
@@ -553,6 +554,57 @@ motion-ml/
 │   └── mask_generator.py    # Mask 生成器
 └── requirements.txt
 ```
+
+## 移动端部署 (ONNX)
+
+```bash
+# 导出 (同时产出 .pth 权重与 .onnx)
+python export.py --checkpoint checkpoints/best_motion_encoder.pth --output_dir exported --onnx
+
+# 验证导出结果 (必须跑, 导出成功≠正确)
+python verify_onnx.py
+```
+
+产物 `exported/motion_motion_encoder.onnx`（约 0.6 MB，单文件，权重内嵌）：
+
+| 属性 | 值 |
+|------|-----|
+| 输入 | `input`, float32, **`[batch_size, 150, 24]`**（batch 动态） |
+| 输出 | `output`, float32, **`[batch_size, 5]`**（batch 动态） |
+| opset | 18 |
+| 参数量 | 104,006 |
+
+类别顺序固定为：`STATIONARY=0, WALKING=1, CYCLING=2, CAR=3, TRAIN=4`。
+
+输入是**已标准化**的 24 维特征（去 yaw/pitch/roll），不是原始传感器值。
+标准化参数 `scaler_mean` / `scaler_scale` 存在 checkpoint 里，
+移动端必须用同一套参数做标准化，否则输出无意义：
+
+```python
+# 移动端预处理伪代码
+x = (raw_features - scaler_mean) / scaler_scale   # raw_features: [150, 24]
+probs = session.run(None, {"input": x[None]})[0]  # [1, 5]
+```
+
+150 帧 = **3 秒**（采样率固定 50 Hz，重采样逻辑见「数据管线」）。
+
+### 导出验证结果
+
+`verify_onnx.py` 会跑三项检查，当前全部通过：
+
+| 检查 | 结果 |
+|------|------|
+| `onnx.checker` | 通过（opset 18，598 KB） |
+| PyTorch vs ONNX 数值一致性（batch 1/2/3/8/32） | max\|Δ\| = 2.38e-06 |
+| 真实数据 22,042 样本预测一致率 | **100.000000%** |
+
+### 一个导出坑（务必留意）
+
+torch 2.x 的 `torch.onnx.export` 默认走 **dynamo 导出器**，但它遇到
+`nn.TransformerEncoder` 会把 **batch 维特化成具体值**——无论 `dynamic_shapes`
+怎么写，输入输出都会被钉成 `[1, ...]`，batch>1 直接报错。
+`export.py` 里强制 `dynamo=False` 走 TorchScript 导出器才能保住动态 batch。
+如果你改了模型结构，导出后请务必用 `verify_onnx.py` 复验，不要只看"导出成功"。
 
 ## 传感器特征 (27 维)
 

@@ -99,28 +99,48 @@ def export_pth(model, checkpoint: dict, output_dir: str, model_type: str):
 
 def export_onnx(model, output_dir: str, model_type: str, seq_len: int = 150):
     """
-    导出为 ONNX 格式。
+    导出为 ONNX 格式, batch 维设为动态 (移动端连续推理需要)。
+
+    注意: torch 2.x 默认走 dynamo 导出器, 但 dynamo 遇到 nn.TransformerEncoder
+    会把 batch 维特化成具体值 (无论 dynamic_shapes 怎么写, 输入输出都被钉成 [1, ...],
+    batch>1 直接报错)。这里强制 dynamo=False 走 TorchScript 导出器,
+    它能保住动态 batch。
     """
     try:
         path = os.path.join(output_dir, f"motion_{model_type}.onnx")
 
         dummy_input = torch.randn(1, seq_len, model.input_size)
 
-        torch.onnx.export(
-            model,
-            dummy_input,
-            path,
-            export_params=True,
-            external_data=False,  # 权重内嵌, 产出单文件 .onnx
-            opset_version=17,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size"},
-                "output": {0: "batch_size"},
-            },
-        )
+        # 关闭 forward 里的注意力缓存副作用 (避免导出时给 self 赋值张量)
+        had_capture = hasattr(model, "_capture_attention")
+        prev = getattr(model, "_capture_attention", None)
+        if had_capture:
+            model._capture_attention = False
+
+        try:
+            # dynamo=False: 必须走 TorchScript 导出器。
+            # dynamo 导出器遇到 nn.TransformerEncoder 会把 batch 维特化成具体值
+            # (无论 dynamic_shapes 怎么写, 输入输出都被钉成 [1, ...], batch>1 直接报错),
+            # 只有遗留导出器能保住动态 batch —— 移动端连续推理必需。
+            torch.onnx.export(
+                model,
+                (dummy_input,),
+                path,
+                export_params=True,
+                external_data=False,  # 权重内嵌, 产出单文件 .onnx
+                opset_version=18,
+                do_constant_folding=True,
+                dynamo=False,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch_size"},
+                    "output": {0: "batch_size"},
+                },
+            )
+        finally:
+            if had_capture:
+                model._capture_attention = prev
 
         size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"[Export] Saved ONNX: {path} ({size_mb:.2f} MB)")
